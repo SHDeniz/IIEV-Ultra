@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  # Hauptanwendung (FastAPI)
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=development
+      - SECRET_KEY=dev-secret-key-change-in-production-12345
+      - DATABASE_URL=mssql+pyodbc://sa:IIEVMeta123!@metadata-db:1433/IIEV_Metadata?driver=ODBC+Driver+17+for+SQL+Server
+      - ERP_DATABASE_URL=mssql+pyodbc://sa:IIEVDev123!@erp-db:1433/ERP_DB?driver=ODBC+Driver+17+for+SQL+Server
+      - AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - metadata-db
+      - redis
+      - azurite
+      - erp-db
+    volumes:
+      - ./src:/app/src
+      - ./assets:/app/assets
+    networks:
+      - iiev-network
+
+  # Celery Worker für asynchrone Verarbeitung
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: celery -A src.tasks.worker worker --loglevel=info
+    environment:
+      - ENVIRONMENT=development
+      - SECRET_KEY=dev-secret-key-change-in-production-12345
+      - DATABASE_URL=mssql+pyodbc://sa:IIEVMeta123!@metadata-db:1433/IIEV_Metadata?driver=ODBC+Driver+17+for+SQL+Server
+      - ERP_DATABASE_URL=mssql+pyodbc://sa:IIEVDev123!@erp-db:1433/ERP_DB?driver=ODBC+Driver+17+for+SQL+Server
+      - AZURE_STORAGE_CONNECTION_STRING=DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - metadata-db
+      - redis
+      - azurite
+      - erp-db
+    volumes:
+      - ./src:/app/src
+      - ./assets:/app/assets
+    networks:
+      - iiev-network
+
+  # MSSQL für Metadaten (konsistent mit Azure SQL)
+  metadata-db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      SA_PASSWORD: "IIEVMeta123!"
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1434:1433"  # Anderer Port als ERP-DB
+    volumes:
+      - metadata_data:/var/opt/mssql
+    networks:
+      - iiev-network
+
+  # MSSQL Server für ERP Simulation (lokale Entwicklung)
+  erp-db:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    environment:
+      SA_PASSWORD: "IIEVDev123!"
+      ACCEPT_EULA: "Y"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    volumes:
+      - mssql_data:/var/opt/mssql
+      # - ./tests/fixtures/erp_schema.sql:/docker-entrypoint-initdb.d/init.sql  # TODO: ERP Schema erstellen
+    networks:
+      - iiev-network
+
+  # Redis für Celery
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - iiev-network
+
+  # Azurite für lokale Azure Storage Emulation
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    ports:
+      - "10000:10000"  # Blob service
+      - "10001:10001"  # Queue service
+      - "10002:10002"  # Table service
+    volumes:
+      - azurite_data:/data
+    command: "azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0"
+    networks:
+      - iiev-network
+
+  # Celery Flower für Monitoring (optional)
+  flower:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: celery -A src.tasks.worker flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    depends_on:
+      - redis
+    networks:
+      - iiev-network
+
+volumes:
+  metadata_data:
+  mssql_data:
+  redis_data:
+  azurite_data:
+
+networks:
+  iiev-network:
+    driver: bridge

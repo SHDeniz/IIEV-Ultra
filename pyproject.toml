@@ -24,6 +24,8 @@ PyPDF2 = "^3.0.1"
 pydantic = "^2.5.0"
 pydantic-settings = "^2.1.0"
 python-multipart = "^0.0.6"
+schwifty = "^2023.9.1"  # IBAN Validierung
+pycountry = "^23.12.11"  # ISO Country Codes
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.3"

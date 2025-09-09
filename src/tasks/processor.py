@@ -5,6 +5,7 @@ Orchestriert den kompletten Rechnungsverarbeitungs-Workflow
 
 from celery import Task
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import DatabaseError, IntegrityError
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
@@ -66,7 +67,17 @@ class CallbackTask(Task):
                 logger.error(f"Fehler beim Update des Transaction Status: {e}")
 
 
-@celery_app.task(bind=True, base=CallbackTask, name="process_invoice_task")
+@celery_app.task(
+    bind=True, 
+    base=CallbackTask, 
+    name="process_invoice_task",
+    autoretry_for=(DatabaseError, ConnectionError, OSError),  # Retry bei transienten Fehlern
+    retry_backoff=True,  # Exponential backoff
+    retry_backoff_max=600,  # Max 10 Minuten
+    retry_jitter=True,  # Zufälliger Jitter
+    max_retries=5,  # Maximum 5 Versuche
+    default_retry_delay=60  # 1 Minute Basis-Delay
+)
 def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
     """
     Haupt-Task für die Rechnungsverarbeitung
@@ -80,7 +91,7 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
     """
     
     start_time = time.time()
-    logger.info(f"🚀 Starte Rechnungsverarbeitung für Transaction: {transaction_id}")
+    logger.info(f"🚀 Starte Rechnungsverarbeitung für Transaction: {transaction_id} (Versuch {self.request.retries + 1})")
     
     try:
         with get_metadata_session() as db:
@@ -92,10 +103,39 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             if not transaction:
                 raise Exception(f"Transaction {transaction_id} nicht gefunden")
             
-            # Status auf PROCESSING setzen
+            # IDEMPOTENZ CHECK: Prüfe aktuellen Status
+            if transaction.status == TransactionStatus.PROCESSING:
+                logger.warning(f"Transaction {transaction_id} bereits in Verarbeitung. Race Condition erkannt.")
+                return {
+                    "transaction_id": transaction_id,
+                    "status": "already_processing",
+                    "message": "Transaction wird bereits verarbeitet (Race Condition vermieden)"
+                }
+            
+            if transaction.status not in [TransactionStatus.RECEIVED, TransactionStatus.ERROR]:
+                logger.info(f"Transaction {transaction_id} bereits verarbeitet (Status: {transaction.status.value})")
+                return {
+                    "transaction_id": transaction_id,
+                    "status": "already_processed",
+                    "current_status": transaction.status.value,
+                    "message": "Transaction bereits erfolgreich verarbeitet"
+                }
+            
+            # Status auf PROCESSING setzen (mit optimistischem Locking)
             transaction.status = TransactionStatus.PROCESSING
             transaction.updated_at = datetime.now()
-            db.commit()
+            
+            try:
+                db.commit()
+            except IntegrityError as e:
+                # Race Condition beim Status-Update
+                logger.warning(f"Race Condition beim Status-Update für {transaction_id}: {e}")
+                db.rollback()
+                return {
+                    "transaction_id": transaction_id,
+                    "status": "race_condition",
+                    "message": "Andere Worker-Instanz verarbeitet bereits diese Transaction"
+                }
             
             # Processing Log starten
             _log_processing_step(db, transaction_id, "processing_started", "started", "Verarbeitung gestartet")
@@ -192,31 +232,74 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             }
             
     except Exception as e:
-        # Fehlerbehandlung
+        # Fehlerbehandlung mit Retry-Logik
         processing_time = time.time() - start_time
-        logger.error(f"❌ Fehler bei Rechnungsverarbeitung {transaction_id}: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
         
-        try:
-            with get_metadata_session() as db:
-                transaction = db.query(InvoiceTransaction).filter(
-                    InvoiceTransaction.id == transaction_id
-                ).first()
-                
-                if transaction:
-                    transaction.status = TransactionStatus.ERROR
-                    transaction.error_message = str(e)
-                    transaction.error_details = {"traceback": traceback.format_exc()}
-                    transaction.processing_time_seconds = processing_time
-                    transaction.updated_at = datetime.now()
-                    db.commit()
-                    
-                    _log_processing_step(db, transaction_id, "processing_failed", "failed", str(e))
-                    
-        except Exception as db_error:
-            logger.error(f"Fehler beim Speichern des Fehler-Status: {db_error}")
+        # Prüfe, ob es sich um einen retriable Fehler handelt
+        is_retriable = isinstance(e, (DatabaseError, ConnectionError, OSError))
         
-        raise  # Re-raise für Celery Retry-Mechanismus
+        if is_retriable and self.request.retries < self.max_retries:
+            logger.warning(f"⚠️ Transienter Fehler bei {transaction_id} (Versuch {self.request.retries + 1}): {str(e)}")
+            
+            # Für retriable Fehler: Status nicht auf ERROR setzen
+            try:
+                with get_metadata_session() as db:
+                    transaction = db.query(InvoiceTransaction).filter(
+                        InvoiceTransaction.id == transaction_id
+                    ).first()
+                    
+                    if transaction and transaction.status == TransactionStatus.PROCESSING:
+                        # Status zurück auf RECEIVED für Retry
+                        transaction.status = TransactionStatus.RECEIVED
+                        transaction.updated_at = datetime.now()
+                        db.commit()
+                        
+                        _log_processing_step(db, transaction_id, "processing_retry", "retry", 
+                                           f"Retry {self.request.retries + 1} nach transienten Fehler: {str(e)}")
+                        
+            except Exception as db_error:
+                logger.error(f"Fehler beim Retry-Status Update: {db_error}")
+            
+            # Celery Retry auslösen
+            raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+        
+        else:
+            # Permanenter Fehler oder Max Retries erreicht
+            logger.error(f"❌ Permanenter Fehler bei Rechnungsverarbeitung {transaction_id}: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            try:
+                with get_metadata_session() as db:
+                    transaction = db.query(InvoiceTransaction).filter(
+                        InvoiceTransaction.id == transaction_id
+                    ).first()
+                    
+                    if transaction:
+                        transaction.status = TransactionStatus.ERROR
+                        transaction.error_message = str(e)
+                        transaction.error_details = {
+                            "traceback": traceback.format_exc(),
+                            "retries_attempted": self.request.retries,
+                            "is_retriable_error": is_retriable
+                        }
+                        transaction.processing_time_seconds = processing_time
+                        transaction.updated_at = datetime.now()
+                        db.commit()
+                        
+                        _log_processing_step(db, transaction_id, "processing_failed", "failed", 
+                                           f"Permanenter Fehler nach {self.request.retries} Versuchen: {str(e)}")
+                        
+            except Exception as db_error:
+                logger.error(f"Fehler beim Speichern des Fehler-Status: {db_error}")
+            
+            # Nicht re-raisen für permanente Fehler - Task als "completed with error" markieren
+            return {
+                "transaction_id": transaction_id,
+                "status": "failed",
+                "error": str(e),
+                "retries_attempted": self.request.retries,
+                "processing_time_seconds": processing_time
+            }
 
 
 @celery_app.task(name="email_monitoring_task")

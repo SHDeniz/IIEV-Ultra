@@ -9,17 +9,37 @@ from datetime import date
 from decimal import Decimal
 from typing import Optional, List
 from enum import Enum
+import pycountry
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def get_valid_country_codes() -> List[str]:
+    """Dynamische Liste aller gültigen ISO 3166-1 alpha-2 Ländercodes"""
+    return [country.alpha_2 for country in pycountry.countries]
 
 
 class CountryCode(str, Enum):
-    """ISO 3166-1 alpha-2 Ländercodes"""
-    DE = "DE"
-    AT = "AT"
-    CH = "CH"
-    FR = "FR"
-    NL = "NL"
-    BE = "BE"
-    # Weitere nach Bedarf
+    """ISO 3166-1 alpha-2 Ländercodes - Häufigste europäische Länder"""
+    DE = "DE"  # Deutschland
+    AT = "AT"  # Österreich  
+    CH = "CH"  # Schweiz
+    FR = "FR"  # Frankreich
+    NL = "NL"  # Niederlande
+    BE = "BE"  # Belgien
+    IT = "IT"  # Italien
+    ES = "ES"  # Spanien
+    PL = "PL"  # Polen
+    CZ = "CZ"  # Tschechien
+    DK = "DK"  # Dänemark
+    SE = "SE"  # Schweden
+    NO = "NO"  # Norwegen
+    FI = "FI"  # Finnland
+    GB = "GB"  # Großbritannien
+    IE = "IE"  # Irland
+    LU = "LU"  # Luxemburg
+    # Weitere können bei Bedarf hinzugefügt werden
 
 
 class CurrencyCode(str, Enum):
@@ -80,18 +100,57 @@ class Party(BaseModel):
     @field_validator('vat_id')
     @classmethod
     def validate_vat_id(cls, v):
-        if v and not v.startswith(('DE', 'AT', 'CH', 'FR', 'NL', 'BE')):
-            # Warnung, aber nicht blockierend
-            pass
+        """Erweiterte VAT-ID Validierung mit pycountry"""
+        if v:
+            # Prüfe, ob die ersten 2 Zeichen ein gültiger Ländercode sind
+            if len(v) >= 2:
+                country_code = v[:2].upper()
+                valid_countries = get_valid_country_codes()
+                if country_code not in valid_countries:
+                    logger.warning(f"Unbekannter Ländercode in VAT-ID: {country_code}")
+                    # Warnung, aber nicht blockierend für Robustheit
+            else:
+                logger.warning(f"VAT-ID zu kurz: {v}")
         return v
 
 
 class BankDetails(BaseModel):
     """Bankverbindung für Zahlungen"""
-    iban: str = Field(..., regex=r"^[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}$")
+    iban: str = Field(..., min_length=15, max_length=34)  # IBAN Länge variiert je nach Land
     bic: Optional[str] = Field(None, regex=r"^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$")
     account_name: Optional[str] = None
     bank_name: Optional[str] = None
+    
+    @field_validator('iban')
+    @classmethod
+    def validate_iban(cls, v):
+        """IBAN Validierung mit schwifty Bibliothek"""
+        try:
+            from schwifty import IBAN
+            # Normalisiere IBAN (entferne Leerzeichen, zu Großbuchstaben)
+            normalized_iban = v.replace(' ', '').upper()
+            
+            # Validiere mit schwifty
+            iban_obj = IBAN(normalized_iban)
+            
+            # Zusätzliche Prüfungen
+            if not iban_obj.is_valid:
+                logger.warning(f"IBAN Prüfsumme ungültig: {v}")
+                # Warnung, aber nicht blockierend für Robustheit
+            
+            return normalized_iban
+            
+        except ImportError:
+            logger.warning("schwifty nicht verfügbar, verwende Basis-Regex Validierung")
+            # Fallback auf einfache Regex-Prüfung
+            import re
+            if not re.match(r"^[A-Z]{2}[0-9]{2}[A-Z0-9]{4}[0-9]{7}([A-Z0-9]?){0,16}$", v.replace(' ', '').upper()):
+                logger.warning(f"IBAN Format ungültig: {v}")
+            return v.replace(' ', '').upper()
+        except Exception as e:
+            logger.warning(f"IBAN Validierungsfehler für {v}: {e}")
+            # Bei Fehlern nicht blockieren, aber normalisieren
+            return v.replace(' ', '').upper()
 
 
 class PaymentTerms(BaseModel):
@@ -214,6 +273,7 @@ class CanonicalInvoice(BaseModel):
     # Zusätzliche Felder
     note: Optional[str] = None
     due_date: Optional[date] = None
+    delivery_date: Optional[date] = None  # Leistungsdatum für §14 UStG Compliance
     
     @field_validator('tax_inclusive_amount')
     @classmethod

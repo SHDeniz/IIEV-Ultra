@@ -6,9 +6,8 @@ Verfolgt den Status jeder eingehenden Rechnung
 import enum
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Enum, JSON, DateTime, func, Text, Integer, Numeric
+from sqlalchemy import Column, String, Enum, JSON, DateTime, func, Text, Integer, Numeric, Boolean, ForeignKey
 from sqlalchemy.dialects.mssql import UNIQUEIDENTIFIER
-from sqlalchemy import String
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -51,8 +50,8 @@ class InvoiceTransaction(Base):
     # Primärschlüssel
     id = Column(UNIQUEIDENTIFIER, primary_key=True, default=uuid.uuid4)
     
-    # Status und Format
-    status = Column(Enum(TransactionStatus), nullable=False, default=TransactionStatus.RECEIVED)
+    # Status und Format (mit Index für Performance)
+    status = Column(Enum(TransactionStatus), nullable=False, default=TransactionStatus.RECEIVED, index=True)
     format_detected = Column(Enum(InvoiceFormat), nullable=True)
     
     # Datei-Informationen
@@ -69,29 +68,29 @@ class InvoiceTransaction(Base):
     validation_level_reached = Column(Enum(ValidationLevel), nullable=True)
     
     # Extrahierte Schlüsseldaten (für schnellen Zugriff)
-    invoice_number = Column(String(100), nullable=True)
+    invoice_number = Column(String(100), nullable=True, index=True)  # Index für Duplikatscheck
     issue_date = Column(DateTime, nullable=True)
-    total_amount = Column(Numeric(precision=10, scale=2), nullable=True)
+    total_amount = Column(Numeric(precision=18, scale=2), nullable=True)  # Erhöhte Präzision für B2B
     currency_code = Column(String(3), nullable=True)  # ISO 4217
     
     # Parteien-Informationen
     seller_name = Column(String(255), nullable=True)
-    seller_vat_id = Column(String(50), nullable=True)
+    seller_vat_id = Column(String(50), nullable=True, index=True)  # Index für ERP Lookup
     buyer_name = Column(String(255), nullable=True)
     buyer_vat_id = Column(String(50), nullable=True)
     
     # ERP Integration
     erp_vendor_id = Column(String(50), nullable=True)
     purchase_order_id = Column(String(100), nullable=True)
-    is_duplicate = Column(String(10), nullable=True)  # 'true'/'false'/null
+    is_duplicate = Column(Boolean, nullable=True, default=False)  # Boolean statt String
     
     # Fehler-Tracking
     error_message = Column(Text, nullable=True)
     error_details = Column(JSON, nullable=True)
     retry_count = Column(Integer, default=0)
     
-    # Zeitstempel
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    # Zeitstempel (mit Index für Performance bei Zeitbereichsabfragen)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     processed_at = Column(DateTime(timezone=True), nullable=True)
     
@@ -136,7 +135,7 @@ class ProcessingLog(Base):
     __tablename__ = 'processing_logs'
     
     id = Column(UNIQUEIDENTIFIER, primary_key=True, default=uuid.uuid4)
-    transaction_id = Column(UNIQUEIDENTIFIER, nullable=False, index=True)
+    transaction_id = Column(UNIQUEIDENTIFIER, ForeignKey('invoice_transactions.id'), nullable=False, index=True)
     
     step_name = Column(String(100), nullable=False)  # z.B. "format_detection", "xsd_validation"
     step_status = Column(String(20), nullable=False)  # "started", "completed", "failed"

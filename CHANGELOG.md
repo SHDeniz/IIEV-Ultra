@@ -74,6 +74,38 @@ Das Foundation-Setup ist vollständig. Alle Grundlagen für Sprint 1 (Ingestion 
 
 **Review-Feedback vollständig implementiert! 🚀**
 
+### 2024-12-19 (Fortsetzung)
+
+#### Sprint 2 Fortschritt: XML-Mapper Implementation 🎯
+- ✅ **CII Mapper (`cii_mapper.py`)**: Vollständige Transformation von ZUGFeRD/Factur-X/XRechnung CII zu Canonical Model
+  - Robuste XPath-Extraktion mit Namespace-Handling
+  - Intelligente Preisberechnung mit BasisQuantity-Unterstützung
+  - Steueraufschlüsselung mit VAT-Fokus und Kategorien-Validierung
+  - Parteien-Mapping mit strikter Ländercode-Validierung
+  - Bankdetails-Extraktion für Zahlungsinformationen
+- ✅ **UBL Mapper (`ubl_mapper.py`)**: Vollständige Transformation von XRechnung UBL/Peppol zu Canonical Model
+  - Dynamische Dokumenttyp-Erkennung (Invoice/CreditNote)
+  - Robuste TaxTotal/TaxSubtotal Verarbeitung
+  - Flexible Parteien-Namensextraktion (PartyName vs PartyLegalEntity)
+  - BaseQuantity-basierte Preisberechnung
+- ✅ **Mapper Orchestrator (`mapper.py`)**: Intelligente Format-Erkennung und Routing
+  - Cross-Format Validierung und Diskrepanz-Erkennung
+  - Hybridformat-Handling (ZUGFeRD → CII Syntax)
+  - Umfassende Fehlerbehandlung mit spezifischen MappingErrors
+- ✅ **XPath Utilities (`xpath_util.py`)**: Robuste XML-Verarbeitung
+  - Typsichere Decimal-Extraktion für Währungsbeträge
+  - Mandatory/Optional Feld-Handling
+  - Namespace-aware XPath-Queries
+
+#### Technische Highlights der Mapper
+- **EN 16931 Compliance**: Vollständige Abdeckung aller Pflichtfelder nach europäischem Standard
+- **Robuste Berechnungslogik**: BasisQuantity/BaseQuantity-Handling für korrekte Stückpreise
+- **Strikte Validierung**: Länder- und Währungscodes gegen Canonical Model Enums
+- **Fehlerresilienz**: Graceful Handling von optionalen Feldern und Formatvarianten
+- **Performance-Optimiert**: Effiziente XPath-Queries mit Namespace-Caching
+
+**Komplexester Systemteil erfolgreich implementiert! 🏆**
+
 ---
 
 ## Sprint-Planung
@@ -91,8 +123,14 @@ Das Foundation-Setup ist vollständig. Alle Grundlagen für Sprint 1 (Ingestion 
 ### Sprint 1: Ingestion Service (Woche 2-3)
 **Ziel**: Rechnungen empfangen, speichern und Verarbeitung starten
 
-### Sprint 2: Format & Extraction (Woche 4)
+### Sprint 2: Format & Extraction (Woche 4) ✅ 
 **Ziel**: Verschiedene Rechnungsformate erkennen und XML extrahieren
+
+- [x] Task 2.1: XML Erkennung (XRechnung) ✅
+- [x] Task 2.2: ZUGFeRD/Factur-X Extraktion ✅
+- [x] Task 2.3: CII-zu-Canonical Mapping ✅
+- [x] Task 2.4: UBL-zu-Canonical Mapping ✅
+- [x] Task 2.5: Mapper Orchestration ✅
 
 ### Sprint 3: Core Validation (Woche 5-6)
 **Ziel**: XSD- und Schematron-Validierung implementieren

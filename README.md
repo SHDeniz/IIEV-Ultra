@@ -49,6 +49,14 @@ Das Projekt wird in 6 Sprints (12 Wochen) entwickelt:
 
 ## Aktuelle Phase
 
-🚧 **Sprint 0: Foundation Setup** - Projektstruktur und Grundlagen werden erstellt.
+✅ **Sprint 0: Foundation Setup** - Abgeschlossen  
+🎯 **Sprint 2: XML-Mapper Implementation** - Komplexester Systemteil erfolgreich implementiert!
+
+### Aktuelle Highlights:
+- ✅ **CII Mapper**: ZUGFeRD/Factur-X/XRechnung CII → Canonical Model
+- ✅ **UBL Mapper**: XRechnung UBL/Peppol → Canonical Model  
+- ✅ **Mapper Orchestrator**: Intelligente Format-Erkennung und Routing
+- ✅ **XPath Utilities**: Robuste, typsichere XML-Verarbeitung
+- ✅ **EN 16931 Compliance**: Vollständige europäische Standard-Abdeckung
 
 Siehe [CHANGELOG.md](./CHANGELOG.md) für detaillierte Entwicklungsfortschritte.

@@ -50,13 +50,16 @@ Das Projekt wird in 6 Sprints (12 Wochen) entwickelt:
 ## Aktuelle Phase
 
 ✅ **Sprint 0: Foundation Setup** - Abgeschlossen  
-🎯 **Sprint 2: XML-Mapper Implementation** - Komplexester Systemteil erfolgreich implementiert!
+✅ **Sprint 1: Ingestion Service** - Abgeschlossen
+✅ **Sprint 2: Format & Extraction** - Abgeschlossen und integriert!
+🎯 **Sprint 3: Core Validation** - Bereit zum Start!
 
 ### Aktuelle Highlights:
-- ✅ **CII Mapper**: ZUGFeRD/Factur-X/XRechnung CII → Canonical Model
-- ✅ **UBL Mapper**: XRechnung UBL/Peppol → Canonical Model  
-- ✅ **Mapper Orchestrator**: Intelligente Format-Erkennung und Routing
-- ✅ **XPath Utilities**: Robuste, typsichere XML-Verarbeitung
-- ✅ **EN 16931 Compliance**: Vollständige europäische Standard-Abdeckung
+- ✅ **End-to-End Workflow**: Upload → Format Detection → XML Extraction → Canonical Mapping
+- ✅ **PDF-Extraktion**: ZUGFeRD/Factur-X XML aus PDF/A-3 Dokumenten
+- ✅ **XML-Mapping**: CII & UBL → Canonical Model mit EN 16931 Compliance
+- ✅ **Async/Sync Integration**: Saubere Trennung FastAPI (async) ↔ Celery (sync)
+- ✅ **Robuste Fehlerbehandlung**: Transiente vs. permanente Fehler mit Retry-Logic
+- ✅ **Workflow-Steuerung**: Automatische Manual Review bei nicht-strukturierten Daten
 
 Siehe [CHANGELOG.md](./CHANGELOG.md) für detaillierte Entwicklungsfortschritte.

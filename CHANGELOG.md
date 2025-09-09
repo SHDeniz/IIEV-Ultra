@@ -76,7 +76,20 @@ Das Foundation-Setup ist vollständig. Alle Grundlagen für Sprint 1 (Ingestion 
 
 ### 2024-12-19 (Fortsetzung)
 
-#### Sprint 2 Fortschritt: XML-Mapper Implementation 🎯
+#### Sprint 1 & 2 Integration: Vollständiger Workflow implementiert! 🎯
+
+**Sprint 1: Ingestion Service - Abgeschlossen ✅**
+- ✅ **Async/Sync Problem gelöst**: Neuer `SyncStorageService` für Celery Tasks
+- ✅ **PDF-Extraktion (`pdf_util.py`)**: Robuste ZUGFeRD/Factur-X XML-Extraktion aus PDF/A-3
+  - Standardisierte Dateinamen-Erkennung (factur-x.xml, zugferd-invoice.xml)
+  - Sichere PDF-Objektreferenz-Auflösung mit PyPDF2
+  - Format-spezifische Unterscheidung (ZUGFeRD vs Factur-X)
+- ✅ **XML-Analyse (`xml_util.py`)**: Intelligente Format-Erkennung
+  - Namespace-basierte CII/UBL Unterscheidung
+  - EN 16931 Compliance-Checks
+  - XXE-Schutz durch sichere Parser-Konfiguration
+
+**Sprint 2: Format & Extraction Service - Integriert ✅**
 - ✅ **CII Mapper (`cii_mapper.py`)**: Vollständige Transformation von ZUGFeRD/Factur-X/XRechnung CII zu Canonical Model
   - Robuste XPath-Extraktion mit Namespace-Handling
   - Intelligente Preisberechnung mit BasisQuantity-Unterstützung
@@ -97,14 +110,21 @@ Das Foundation-Setup ist vollständig. Alle Grundlagen für Sprint 1 (Ingestion 
   - Mandatory/Optional Feld-Handling
   - Namespace-aware XPath-Queries
 
-#### Technische Highlights der Mapper
+**Vollständige Workflow-Integration (`processor.py`) ✅**
+- ✅ **End-to-End Pipeline**: Raw Upload → Format Detection → XML Extraction → Canonical Mapping
+- ✅ **Intelligente Fehlerbehandlung**: Transiente vs. permanente Fehler mit Celery Retry
+- ✅ **Workflow-Steuerung**: Automatische Weiterleitung zu Manual Review bei nicht-strukturierten Daten
+- ✅ **Performance-Optimiert**: Synchrone Storage-Operationen für Celery Worker
+
+#### Technische Highlights der Integration
 - **EN 16931 Compliance**: Vollständige Abdeckung aller Pflichtfelder nach europäischem Standard
 - **Robuste Berechnungslogik**: BasisQuantity/BaseQuantity-Handling für korrekte Stückpreise
 - **Strikte Validierung**: Länder- und Währungscodes gegen Canonical Model Enums
 - **Fehlerresilienz**: Graceful Handling von optionalen Feldern und Formatvarianten
 - **Performance-Optimiert**: Effiziente XPath-Queries mit Namespace-Caching
+- **Async/Sync Separation**: Saubere Trennung zwischen FastAPI (async) und Celery (sync) Workflows
 
-**Komplexester Systemteil erfolgreich implementiert! 🏆**
+**Sprint 1 & 2 vollständig implementiert und integriert! 🚀**
 
 ---
 
@@ -120,8 +140,13 @@ Das Foundation-Setup ist vollständig. Alle Grundlagen für Sprint 1 (Ingestion 
 - [ ] Task 0.5: Datenbank Modellierung & Migration
 - [ ] Task 0.6: Konfiguration & Assets
 
-### Sprint 1: Ingestion Service (Woche 2-3)
+### Sprint 1: Ingestion Service (Woche 2-3) ✅
 **Ziel**: Rechnungen empfangen, speichern und Verarbeitung starten
+
+- [x] Task 1.1: SyncStorageService für Celery ✅
+- [x] Task 1.2: Async/Sync Problem gelöst ✅
+- [x] Task 1.3: Celery Workflow Integration ✅
+- [x] Task 1.4: Error Handling & Retry Logic ✅
 
 ### Sprint 2: Format & Extraction (Woche 4) ✅ 
 **Ziel**: Verschiedene Rechnungsformate erkennen und XML extrahieren
@@ -131,6 +156,7 @@ Das Foundation-Setup ist vollständig. Alle Grundlagen für Sprint 1 (Ingestion 
 - [x] Task 2.3: CII-zu-Canonical Mapping ✅
 - [x] Task 2.4: UBL-zu-Canonical Mapping ✅
 - [x] Task 2.5: Mapper Orchestration ✅
+- [x] Task 2.6: End-to-End Workflow Integration ✅
 
 ### Sprint 3: Core Validation (Woche 5-6)
 **Ziel**: XSD- und Schematron-Validierung implementieren

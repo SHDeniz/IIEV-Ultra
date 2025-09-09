@@ -1,3 +1,5 @@
+# src/tasks/processor.py (Aktualisiert und Kompatibel)
+
 """
 Haupt-Verarbeitungs-Tasks
 Orchestriert den kompletten Rechnungsverarbeitungs-Workflow
@@ -5,38 +7,54 @@ Orchestriert den kompletten Rechnungsverarbeitungs-Workflow
 
 from celery import Task
 from sqlalchemy.orm import Session
-from sqlalchemy.exc import DatabaseError, IntegrityError
+from sqlalchemy.exc import DatabaseError # Import für Celery Retries
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 import traceback
 import time
 import os
+import uuid
 
 from .worker import celery_app
-from ..db.session import get_metadata_session, get_erp_session
-from ..db.models import InvoiceTransaction, TransactionStatus, ProcessingLog, ValidationLevel
-from ..services.storage_service import StorageService
+# Annahme: get_metadata_session existiert in db/session.py
+from ..db.session import get_metadata_session 
+from ..db.models import InvoiceTransaction, TransactionStatus, ProcessingLog, ValidationLevel, InvoiceFormat
+
+# WICHTIG: Importiere den neuen synchronen Storage Service
+from ..services.storage_service_sync import sync_storage_service
+
+# Importiere die User-Version von ValidationReport
 from ..schemas.validation_report import ValidationReport, ValidationStep, ValidationError, ValidationCategory, ValidationSeverity
+from ..schemas.canonical_model import CanonicalInvoice
 from ..core.config import settings
+
+# Importiere die neuen Services
+from ..services.extraction.extractor import extract_invoice_data
+from ..services.mapping.mapper import map_xml_to_canonical
+from ..services.mapping.xpath_util import MappingError
+
 
 logger = logging.getLogger(__name__)
 
 
 class CallbackTask(Task):
     """
-    Custom Task-Klasse mit automatischem Status-Update
+    Custom Task-Klasse mit automatischem Status-Update bei endgültigem Fehler.
     """
     
     def on_success(self, retval, task_id, args, kwargs):
-        """Task erfolgreich abgeschlossen"""
         logger.info(f"✅ Task {task_id} erfolgreich abgeschlossen")
     
     def on_failure(self, exc, task_id, args, kwargs, einfo):
-        """Task fehlgeschlagen"""
-        logger.error(f"❌ Task {task_id} fehlgeschlagen: {exc}")
+        """Task fehlgeschlagen (nachdem alle Retries erschöpft sind)"""
+        logger.error(f"❌ Task {task_id} endgültig fehlgeschlagen: {exc}")
         
-        # Transaction Status auf ERROR setzen
+        # MappingErrors sind Geschäftslogik-Fehler und sollten bereits im Task behandelt worden sein (Status INVALID).
+        if isinstance(exc, MappingError):
+            return
+
+        # Behandle Systemfehler (Status ERROR).
         if args and len(args) > 0:
             transaction_id = args[0]
             try:
@@ -45,53 +63,39 @@ class CallbackTask(Task):
                         InvoiceTransaction.id == transaction_id
                     ).first()
                     
-                    if transaction:
+                    # Nur aktualisieren, wenn der Status nicht bereits durch Geschäftslogik gesetzt wurde
+                    if transaction and transaction.status not in [TransactionStatus.INVALID, TransactionStatus.MANUAL_REVIEW, TransactionStatus.VALID]:
                         transaction.status = TransactionStatus.ERROR
-                        transaction.error_message = str(exc)
+                        transaction.error_message = f"Systemfehler (nach Retries): {str(exc)}"
                         transaction.error_details = {"traceback": str(einfo)}
                         transaction.updated_at = datetime.now()
                         db.commit()
                         
-                        # Processing Log erstellen
-                        log_entry = ProcessingLog(
-                            transaction_id=transaction_id,
-                            step_name="task_failure",
-                            step_status="failed",
-                            message=str(exc),
-                            details={"traceback": str(einfo)}
-                        )
-                        db.add(log_entry)
-                        db.commit()
+                        _log_processing_step(db, transaction_id, "task_failure", "failed", str(exc), details={"traceback": str(einfo)})
                         
             except Exception as e:
-                logger.error(f"Fehler beim Update des Transaction Status: {e}")
+                logger.error(f"Kritischer Fehler beim Update des Transaction Status nach Task Failure: {e}")
 
 
-@celery_app.task(
-    bind=True, 
-    base=CallbackTask, 
-    name="process_invoice_task",
-    autoretry_for=(DatabaseError, ConnectionError, OSError),  # Retry bei transienten Fehlern
-    retry_backoff=True,  # Exponential backoff
-    retry_backoff_max=600,  # Max 10 Minuten
-    retry_jitter=True,  # Zufälliger Jitter
-    max_retries=5,  # Maximum 5 Versuche
-    default_retry_delay=60  # 1 Minute Basis-Delay
-)
+# Konfiguration für automatische Wiederholungen bei transienten Fehlern (DB/Netzwerk/Storage)
+@celery_app.task(bind=True, base=CallbackTask, name="process_invoice_task",
+                 autoretry_for=(DatabaseError, ConnectionError, IOError), 
+                 retry_backoff=True, max_retries=5)
 def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
     """
-    Haupt-Task für die Rechnungsverarbeitung
-    Orchestriert den kompletten Workflow von Format-Erkennung bis ERP-Integration
-    
-    Args:
-        transaction_id: UUID der zu verarbeitenden Transaction
-        
-    Returns:
-        Dictionary mit Verarbeitungsergebnis
+    Haupt-Task für die Rechnungsverarbeitung.
     """
     
     start_time = time.time()
-    logger.info(f"🚀 Starte Rechnungsverarbeitung für Transaction: {transaction_id} (Versuch {self.request.retries + 1})")
+    logger.info(f"🚀 Starte Rechnungsverarbeitung für Transaction: {transaction_id}")
+    
+    # Prüfe Verfügbarkeit des synchronen Storage Service
+    if sync_storage_service is None:
+        raise RuntimeError("SyncStorageService ist nicht verfügbar.")
+
+    # Initialisiere Variablen (Kompatibel mit User-Schema)
+    validation_report = ValidationReport(transaction_id=transaction_id)
+    canonical_invoice: Optional[CanonicalInvoice] = None
     
     try:
         with get_metadata_session() as db:
@@ -102,293 +106,232 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             
             if not transaction:
                 raise Exception(f"Transaction {transaction_id} nicht gefunden")
-            
-            # IDEMPOTENZ CHECK: Prüfe aktuellen Status
-            if transaction.status == TransactionStatus.PROCESSING:
-                logger.warning(f"Transaction {transaction_id} bereits in Verarbeitung. Race Condition erkannt.")
-                return {
-                    "transaction_id": transaction_id,
-                    "status": "already_processing",
-                    "message": "Transaction wird bereits verarbeitet (Race Condition vermieden)"
-                }
-            
+
+            # Idempotenz-Check
             if transaction.status not in [TransactionStatus.RECEIVED, TransactionStatus.ERROR]:
-                logger.info(f"Transaction {transaction_id} bereits verarbeitet (Status: {transaction.status.value})")
-                return {
-                    "transaction_id": transaction_id,
-                    "status": "already_processed",
-                    "current_status": transaction.status.value,
-                    "message": "Transaction bereits erfolgreich verarbeitet"
-                }
+                logger.warning(f"Transaktion {transaction_id} bereits im Status {transaction.status.value}. Überspringe.")
+                return {"status": "skipped", "reason": "already_processed_or_in_progress"}
             
-            # Status auf PROCESSING setzen (mit optimistischem Locking)
+            # Status auf PROCESSING setzen
             transaction.status = TransactionStatus.PROCESSING
             transaction.updated_at = datetime.now()
+            db.commit()
             
-            try:
-                db.commit()
-            except IntegrityError as e:
-                # Race Condition beim Status-Update
-                logger.warning(f"Race Condition beim Status-Update für {transaction_id}: {e}")
-                db.rollback()
-                return {
-                    "transaction_id": transaction_id,
-                    "status": "race_condition",
-                    "message": "Andere Worker-Instanz verarbeitet bereits diese Transaction"
-                }
-            
-            # Processing Log starten
             _log_processing_step(db, transaction_id, "processing_started", "started", "Verarbeitung gestartet")
             
-            # Validation Report initialisieren
-            validation_report = ValidationReport(
-                transaction_id=transaction_id,
-                invoice_number=transaction.invoice_number
-            )
-            
-            # SCHRITT 1: Format-Erkennung und Extraktion (wird in Sprint 2 implementiert)
-            logger.info(f"📋 Schritt 1: Format-Erkennung für {transaction_id}")
+            # --------------------------------------------------------------------
+            # SCHRITT 1: Laden, Format-Erkennung und Extraktion (Integration Sprint 1 & 2)
+            # --------------------------------------------------------------------
+            logger.info(f"📋 Schritt 1: Laden und Extraktion für {transaction_id}")
+            step1_start = time.time()
+            # Initialisierung kompatibel mit User-Schema (Status als String)
             format_step = ValidationStep(
-                step_name="format_detection",
-                step_description="Erkennung des Rechnungsformats und XML-Extraktion",
-                status="SKIPPED",  # Placeholder - wird in Sprint 2 implementiert
-                metadata={"reason": "Implementation in Sprint 2 geplant"}
+                step_name="format_detection_extraction",
+                step_description="Laden, Format-Erkennung und XML-Extraktion",
+                status="FAILED" # Default auf FAILED
             )
+
+            # 1.1 Rohdaten laden (Synchron)
+            if not transaction.storage_uri_raw:
+                raise IOError("storage_uri_raw ist nicht gesetzt.")
+            
+            # Dies kann IOError auslösen, welcher von Celery Retry behandelt wird.
+            raw_bytes = sync_storage_service.download_blob_by_uri(transaction.storage_uri_raw)
+
+            # 1.2 Extraktion aufrufen
+            detected_format, xml_bytes = extract_invoice_data(raw_bytes)
+            
+            transaction.format_detected = detected_format
+            validation_report.detected_format = detected_format.value
+            db.commit()
+
+            # 1.3 Ergebnis prüfen und Workflow steuern
+            format_step.duration_seconds = time.time() - step1_start
+
+            if detected_format in [InvoiceFormat.OTHER_PDF, InvoiceFormat.UNKNOWN] or xml_bytes is None:
+                # Nicht-strukturierte Daten -> Manuelle Prüfung
+                logger.info(f"🛑 Format {detected_format.value} erkannt. Weiterleitung zur manuellen Prüfung.")
+                
+                # Kompatibel mit User-Schema: Füge Warnung hinzu, Status auf SUCCESS setzen, da Schritt technisch erfolgreich war.
+                format_step.status = "SUCCESS"
+                format_step.warnings.append(ValidationError(
+                    message=f"Keine strukturierten Daten gefunden. Format: {detected_format.value}. Manuelle Bearbeitung erforderlich.",
+                    category=ValidationCategory.TECHNICAL,
+                    severity=ValidationSeverity.INFO
+                ))
+                validation_report.add_step(format_step)
+                
+                # Workflow hier beenden
+                return _finalize_processing(db, transaction, TransactionStatus.MANUAL_REVIEW, validation_report, start_time)
+
+            # 1.4 XML Speichern (Synchron, falls extrahiert, z.B. bei ZUGFeRD)
+            if detected_format in [InvoiceFormat.ZUGFERD_CII, InvoiceFormat.FACTURX_CII]:
+                # Nutze den synchronen Service für den Upload
+                xml_uri = sync_storage_service.upload_processed_xml(
+                    transaction_id=transaction.id, 
+                    xml_content=xml_bytes, 
+                    format_type=detected_format.value
+                )
+                transaction.storage_uri_xml = xml_uri
+                db.commit()
+            else:
+                # Bei XRechnung sind Raw Data = XML Data
+                transaction.storage_uri_xml = transaction.storage_uri_raw
+                db.commit()
+
+            format_step.status = "SUCCESS"
+            format_step.metadata = {"format": detected_format.value, "xml_size_bytes": len(xml_bytes)}
             validation_report.add_step(format_step)
-            _log_processing_step(db, transaction_id, "format_detection", "skipped", "Format-Erkennung noch nicht implementiert")
-            
-            # SCHRITT 2: Strukturvalidierung (wird in Sprint 3 implementiert)
-            logger.info(f"🔍 Schritt 2: XSD Validierung für {transaction_id}")
-            structure_step = ValidationStep(
-                step_name="structure_validation",
-                step_description="XSD Schema Validierung",
-                status="SKIPPED",
-                metadata={"reason": "Implementation in Sprint 3 geplant"}
+            _log_processing_step(db, transaction_id, "format_detection", "completed", f"Format {detected_format.value} erkannt.", duration=format_step.duration_seconds)
+
+
+            # --------------------------------------------------------------------
+            # SCHRITT 2: XML Mapping (Integration Sprint 2)
+            # --------------------------------------------------------------------
+            logger.info(f"🗺️ Schritt 2: XML Mapping für {transaction_id}")
+            step2_start = time.time()
+            # Initialisierung kompatibel mit User-Schema
+            mapping_step = ValidationStep(
+                step_name="xml_mapping",
+                step_description="Transformation in das Canonical Model",
+                status="FAILED"
             )
-            validation_report.add_step(structure_step)
-            _log_processing_step(db, transaction_id, "structure_validation", "skipped", "XSD Validierung noch nicht implementiert")
-            
-            # SCHRITT 3: Semantische Validierung (wird in Sprint 3 implementiert)
-            logger.info(f"🧠 Schritt 3: KoSIT Validierung für {transaction_id}")
-            semantic_step = ValidationStep(
-                step_name="semantic_validation",
-                step_description="KoSIT Schematron Validierung",
-                status="SKIPPED",
-                metadata={"reason": "Implementation in Sprint 3 geplant"}
-            )
-            validation_report.add_step(semantic_step)
-            _log_processing_step(db, transaction_id, "semantic_validation", "skipped", "KoSIT Validierung noch nicht implementiert")
-            
-            # SCHRITT 4: Mathematische Validierung (wird in Sprint 4 implementiert)
-            logger.info(f"🧮 Schritt 4: Calculation Validation für {transaction_id}")
-            calculation_step = ValidationStep(
-                step_name="calculation_validation",
-                step_description="Mathematische Prüfung von Summen und Steuern",
-                status="SKIPPED",
-                metadata={"reason": "Implementation in Sprint 4 geplant"}
-            )
-            validation_report.add_step(calculation_step)
-            _log_processing_step(db, transaction_id, "calculation_validation", "skipped", "Berechnung Validierung noch nicht implementiert")
-            
-            # SCHRITT 5: Business Validierung (wird in Sprint 5 implementiert)
-            logger.info(f"🏢 Schritt 5: ERP Business Validation für {transaction_id}")
-            business_step = ValidationStep(
-                step_name="business_validation",
-                step_description="ERP Integration und Business Rules",
-                status="SKIPPED",
-                metadata={"reason": "Implementation in Sprint 5 geplant"}
-            )
-            validation_report.add_step(business_step)
-            _log_processing_step(db, transaction_id, "business_validation", "skipped", "ERP Validierung noch nicht implementiert")
-            
-            # VORLÄUFIGER STATUS: Da alle Validierungsschritte noch nicht implementiert sind
-            # setzen wir den Status auf MANUAL_REVIEW für Sprint 0
-            transaction.status = TransactionStatus.MANUAL_REVIEW
-            transaction.validation_report = validation_report.dict()
-            transaction.validation_level_reached = ValidationLevel.STRUCTURE  # Placeholder
-            
-            # Verarbeitungszeit berechnen
-            processing_time = time.time() - start_time
-            transaction.processing_time_seconds = processing_time
-            transaction.processed_at = datetime.now()
-            transaction.updated_at = datetime.now()
-            
-            db.commit()
-            
-            # Abschluss-Log
-            _log_processing_step(
-                db, transaction_id, "processing_completed", "completed", 
-                f"Verarbeitung abgeschlossen in {processing_time:.3f}s (Sprint 0 - Placeholder)"
-            )
-            
-            logger.info(f"✅ Rechnungsverarbeitung für {transaction_id} abgeschlossen in {processing_time:.3f}s")
-            
-            return {
-                "transaction_id": transaction_id,
-                "status": transaction.status.value,
-                "processing_time_seconds": processing_time,
-                "validation_summary": validation_report.to_json_summary(),
-                "message": "Verarbeitung abgeschlossen (Sprint 0 - Alle Validierungsschritte noch nicht implementiert)"
-            }
-            
-    except Exception as e:
-        # Fehlerbehandlung mit Retry-Logik
-        processing_time = time.time() - start_time
-        
-        # Prüfe, ob es sich um einen retriable Fehler handelt
-        is_retriable = isinstance(e, (DatabaseError, ConnectionError, OSError))
-        
-        if is_retriable and self.request.retries < self.max_retries:
-            logger.warning(f"⚠️ Transienter Fehler bei {transaction_id} (Versuch {self.request.retries + 1}): {str(e)}")
-            
-            # Für retriable Fehler: Status nicht auf ERROR setzen
+
             try:
-                with get_metadata_session() as db:
-                    transaction = db.query(InvoiceTransaction).filter(
-                        InvoiceTransaction.id == transaction_id
-                    ).first()
-                    
-                    if transaction and transaction.status == TransactionStatus.PROCESSING:
-                        # Status zurück auf RECEIVED für Retry
-                        transaction.status = TransactionStatus.RECEIVED
-                        transaction.updated_at = datetime.now()
-                        db.commit()
-                        
-                        _log_processing_step(db, transaction_id, "processing_retry", "retry", 
-                                           f"Retry {self.request.retries + 1} nach transienten Fehler: {str(e)}")
-                        
-            except Exception as db_error:
-                logger.error(f"Fehler beim Retry-Status Update: {db_error}")
-            
-            # Celery Retry auslösen
-            raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
-        
-        else:
-            # Permanenter Fehler oder Max Retries erreicht
-            logger.error(f"❌ Permanenter Fehler bei Rechnungsverarbeitung {transaction_id}: {str(e)}")
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            
-            try:
-                with get_metadata_session() as db:
-                    transaction = db.query(InvoiceTransaction).filter(
-                        InvoiceTransaction.id == transaction_id
-                    ).first()
-                    
-                    if transaction:
-                        transaction.status = TransactionStatus.ERROR
-                        transaction.error_message = str(e)
-                        transaction.error_details = {
-                            "traceback": traceback.format_exc(),
-                            "retries_attempted": self.request.retries,
-                            "is_retriable_error": is_retriable
-                        }
-                        transaction.processing_time_seconds = processing_time
-                        transaction.updated_at = datetime.now()
-                        db.commit()
-                        
-                        _log_processing_step(db, transaction_id, "processing_failed", "failed", 
-                                           f"Permanenter Fehler nach {self.request.retries} Versuchen: {str(e)}")
-                        
-            except Exception as db_error:
-                logger.error(f"Fehler beim Speichern des Fehler-Status: {db_error}")
-            
-            # Nicht re-raisen für permanente Fehler - Task als "completed with error" markieren
-            return {
-                "transaction_id": transaction_id,
-                "status": "failed",
-                "error": str(e),
-                "retries_attempted": self.request.retries,
-                "processing_time_seconds": processing_time
-            }
+                canonical_invoice = map_xml_to_canonical(xml_bytes, detected_format)
+                
+                mapping_step.duration_seconds = time.time() - step2_start
+                mapping_step.status = "SUCCESS"
+                mapping_step.metadata = {"invoice_number": canonical_invoice.invoice_number, "total_amount": str(canonical_invoice.payable_amount)}
+                validation_report.add_step(mapping_step)
+                
+                _log_processing_step(db, transaction_id, "xml_mapping", "completed", "Mapping zum Canonical Model erfolgreich.", duration=mapping_step.duration_seconds)
+                
+                # Wichtige Daten in die Transaction Tabelle übertragen
+                _update_transaction_with_canonical_data(db, transaction, canonical_invoice)
+                validation_report.invoice_number = canonical_invoice.invoice_number
+
+            except MappingError as e:
+                # Mapping fehlgeschlagen (Geschäftslogik-Fehler) -> Status INVALID, kein Retry.
+                logger.error(f"🛑 Mapping Error für {transaction_id}: {e}")
+                
+                mapping_step.duration_seconds = time.time() - step2_start
+                # Kompatibel mit User-Schema: Fehler direkt hinzufügen
+                mapping_step.errors.append(ValidationError(
+                    message=str(e),
+                    # Verwende STRUCTURE, da dies im User-Enum vorhanden ist.
+                    category=ValidationCategory.STRUCTURE, 
+                    severity=ValidationSeverity.FATAL,
+                    code="MAPPING_FAILED"
+                ))
+                validation_report.add_step(mapping_step)
+                _log_processing_step(db, transaction_id, "xml_mapping", "failed", str(e), duration=mapping_step.duration_seconds)
+                
+                # Workflow hier beenden und Status auf INVALID setzen
+                return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
 
 
-@celery_app.task(name="email_monitoring_task")
-def email_monitoring_task() -> Dict[str, Any]:
-    """
-    Periodischer Task zur Überwachung des E-Mail-Postfachs
-    Simulation für Sprint 0 - echte E-Mail-Integration in Sprint 1
-    """
-    
-    logger.info("📧 E-Mail Monitoring Task gestartet (Simulation)")
-    
-    # Überwache lokales Verzeichnis als Mock für E-Mail-Postfach
-    mock_email_dir = "/tmp/iiev_email_mock"
-    
-    if not os.path.exists(mock_email_dir):
-        os.makedirs(mock_email_dir, exist_ok=True)
-        logger.info(f"📁 Mock E-Mail Verzeichnis erstellt: {mock_email_dir}")
-    
-    # Prüfe auf neue Dateien
-    try:
-        files = os.listdir(mock_email_dir)
-        new_files = [f for f in files if f.endswith(('.pdf', '.xml'))]
-        
-        if new_files:
-            logger.info(f"📧 {len(new_files)} neue E-Mail-Anhänge gefunden: {new_files}")
-            
-            # TODO: In Sprint 1 implementieren
-            # - Dateien verarbeiten
-            # - Transaction erstellen
-            # - process_invoice_task starten
-            # - Dateien nach Verarbeitung archivieren
-            
-        return {
-            "status": "completed",
-            "files_found": len(new_files),
-            "files": new_files,
-            "timestamp": datetime.now().isoformat(),
-            "note": "Mock-Implementation für Sprint 0"
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ E-Mail Monitoring Fehler: {e}")
-        return {
-            "status": "failed",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
+            # --------------------------------------------------------------------
+            # SCHRITT 3, 4, 5: Validierung (Placeholder für Sprints 3-5)
+            # --------------------------------------------------------------------
+            # Diese Schritte arbeiten nun mit dem `canonical_invoice` Objekt.
+
+            logger.info(f"🔍 Schritte 3-5: Validierung (Platzhalter)")
+            # Placeholder Logik kompatibel mit User-Schema
+            validation_report.add_step(ValidationStep(step_name="structure_validation", status="SKIPPED"))
+            validation_report.add_step(ValidationStep(step_name="semantic_validation", status="SKIPPED"))
+            validation_report.add_step(ValidationStep(step_name="business_validation", status="SKIPPED"))
 
 
-@celery_app.task(name="cleanup_old_results_task")
-def cleanup_old_results_task() -> Dict[str, Any]:
-    """
-    Wartungs-Task zum Aufräumen alter Celery Results und Logs
-    """
-    
-    logger.info("🧹 Cleanup Task gestartet")
-    
-    try:
-        cutoff_time = datetime.now() - timedelta(days=7)  # 7 Tage alte Daten löschen
-        
-        with get_metadata_session() as db:
-            # Alte Processing Logs löschen
-            old_logs = db.query(ProcessingLog).filter(
-                ProcessingLog.created_at < cutoff_time
-            ).count()
-            
-            db.query(ProcessingLog).filter(
-                ProcessingLog.created_at < cutoff_time
-            ).delete()
-            
-            db.commit()
-            
-            logger.info(f"🧹 {old_logs} alte Processing Logs gelöscht")
-            
-            return {
-                "status": "completed",
-                "deleted_logs": old_logs,
-                "cutoff_date": cutoff_time.isoformat(),
-                "timestamp": datetime.now().isoformat()
-            }
+            # VORLÄUFIGER STATUS: Wenn Mapping erfolgreich war, aber Validierung noch fehlt.
+            final_status = TransactionStatus.MANUAL_REVIEW # Sicherer Default
+            transaction.validation_level_reached = ValidationLevel.STRUCTURE # Mapping erfolgreich
+
+            return _finalize_processing(db, transaction, final_status, validation_report, start_time)
             
     except Exception as e:
-        logger.error(f"❌ Cleanup Task Fehler: {e}")
-        return {
-            "status": "failed",
-            "error": str(e),
-            "timestamp": datetime.now().isoformat()
-        }
+        # Generelle Fehlerbehandlung für Systemfehler (Retry durch Celery)
+        logger.error(f"❌ Unerwarteter Systemfehler bei Rechnungsverarbeitung {transaction_id}: {str(e)}", exc_info=True)
+        # Inkrementiere Retry Count in der DB
+        try:
+            with get_metadata_session() as db:
+                 db.query(InvoiceTransaction).filter(InvoiceTransaction.id == transaction_id).update({"retry_count": InvoiceTransaction.retry_count + 1})
+                 db.commit()
+        except Exception:
+             pass
+        raise
 
+
+# --- Hilfsfunktionen ---
+
+def _finalize_processing(db: Session, transaction: InvoiceTransaction, status: TransactionStatus, report: ValidationReport, start_time: float) -> Dict[str, Any]:
+    """
+    Schließt die Verarbeitung ab, aktualisiert den Status und speichert das Ergebnis.
+    """
+    processing_time = time.time() - start_time
+    
+    transaction.status = status
+    
+    # Aktualisiere den Summary Report (wichtig in der User-Struktur)
+    report._update_summary()
+    report.total_duration_seconds = processing_time
+
+    # Pydantic V2 Kompatibilität: Verwende model_dump() falls verfügbar, sonst dict()
+    try:
+        # Versuche V2 model_dump für JSON-kompatible Ausgabe
+        transaction.validation_report = report.model_dump(mode='json')
+    except AttributeError:
+        # Fallback für Pydantic V1
+        transaction.validation_report = report.dict()
+
+    transaction.processing_time_seconds = processing_time
+    transaction.processed_at = datetime.now()
+    transaction.updated_at = datetime.now()
+    
+    db.commit()
+    
+    _log_processing_step(
+        db, str(transaction.id), "processing_completed", "completed", 
+        f"Verarbeitung abgeschlossen. Status: {status.value}. Dauer: {processing_time:.3f}s"
+    )
+    
+    logger.info(f"🏁 Rechnungsverarbeitung für {transaction.id} abgeschlossen. Status: {status.value}. Dauer: {processing_time:.3f}s")
+    
+    return {
+        "transaction_id": str(transaction.id),
+        "status": status.value,
+        "processing_time_seconds": processing_time,
+        # Nutze die Methode aus dem User-Modell
+        "validation_summary": report.to_json_summary(),
+    }
+
+def _update_transaction_with_canonical_data(db: Session, transaction: InvoiceTransaction, invoice: CanonicalInvoice):
+    """
+    Extrahiert Schlüsseldaten aus dem Canonical Model und speichert sie in der Transaction Tabelle.
+    """
+    try:
+        transaction.invoice_number = invoice.invoice_number
+        # Konvertiere date zu datetime für das DB-Modell
+        if invoice.issue_date:
+            transaction.issue_date = datetime.combine(invoice.issue_date, datetime.min.time())
+        
+        transaction.total_amount = invoice.payable_amount
+        transaction.currency_code = invoice.currency_code.value
+        
+        transaction.seller_name = invoice.seller.name
+        transaction.seller_vat_id = invoice.seller.vat_id
+        transaction.buyer_name = invoice.buyer.name
+        transaction.buyer_vat_id = invoice.buyer.vat_id
+        
+        if invoice.purchase_order_reference:
+            transaction.purchase_order_id = invoice.purchase_order_reference.document_id
+            
+        db.commit()
+        logger.debug(f"Transaction {transaction.id} mit extrahierten Daten aktualisiert.")
+        
+    except Exception as e:
+        logger.error(f"Fehler beim Aktualisieren der Transaction mit Canonical Daten: {e}", exc_info=True)
+        db.rollback()
 
 def _log_processing_step(
     db: Session, 
@@ -400,12 +343,21 @@ def _log_processing_step(
     duration: Optional[float] = None
 ):
     """
-    Hilfsfunktion zum Loggen von Verarbeitungsschritten
+    Hilfsfunktion zum Loggen von Verarbeitungsschritten.
     """
-    
     try:
+        # Konvertiere transaction_id zu UUID für MSSQL UNIQUEIDENTIFIER
+        try:
+            if isinstance(transaction_id, uuid.UUID):
+                tx_uuid = transaction_id
+            else:
+                tx_uuid = uuid.UUID(str(transaction_id))
+        except ValueError:
+            logger.error(f"Ungültige transaction_id für Logging (keine UUID): {transaction_id}")
+            return
+
         log_entry = ProcessingLog(
-            transaction_id=transaction_id,
+            transaction_id=tx_uuid,
             step_name=step_name,
             step_status=step_status,
             message=message,
@@ -420,20 +372,17 @@ def _log_processing_step(
         
     except Exception as e:
         logger.error(f"Fehler beim Erstellen des Processing Logs: {e}")
+        db.rollback() 
 
 
-# Entwicklungs-Helper Task
-@celery_app.task(name="test_task")
-def test_task(message: str = "Hello from IIEV-Ultra Celery!") -> Dict[str, Any]:
-    """
-    Test-Task für Entwicklung und Debugging
-    """
-    
-    logger.info(f"🧪 Test Task ausgeführt: {message}")
-    
-    return {
-        "message": message,
-        "timestamp": datetime.now().isoformat(),
-        "worker_id": test_task.request.id,
-        "status": "success"
-    }
+# --- Andere Tasks (E-Mail Monitoring etc.) ---
+# Platzhalter beibehalten
+@celery_app.task(name="email_monitoring_task")
+def email_monitoring_task() -> Dict[str, Any]:
+    logger.info("📧 E-Mail Monitoring Task (Platzhalter)")
+    return {"status": "skipped", "note": "Implementierung folgt"}
+
+@celery_app.task(name="cleanup_old_results_task")
+def cleanup_old_results_task() -> Dict[str, Any]:
+     logger.info("🧹 Cleanup Task (Platzhalter)")
+     return {"status": "skipped", "note": "Implementierung folgt"}

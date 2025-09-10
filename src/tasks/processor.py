@@ -36,6 +36,11 @@ from ..services.extraction.extractor import extract_invoice_data
 from ..services.mapping.mapper import map_xml_to_canonical
 from ..services.mapping.xpath_util import MappingError
 
+from ..services.validation.xsd_validator import validate_xsd
+from ..services.validation.kosit_validator import validate_kosit_schematron
+from ..services.validation.calculation_validator import validate_calculations
+from ..db.models import ValidationLevel
+
 
 logger = logging.getLogger(__name__)
 
@@ -186,12 +191,53 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             validation_report.add_step(format_step)
             _log_processing_step(db, transaction_id, "format_detection", "completed", f"Format {detected_format.value} erkannt.", duration=format_step.duration_seconds)
 
+            # --------------------------------------------------------------------
+            # SCHRITT 2: Technische & Semantische Validierung (Sprint 3)
+            # --------------------------------------------------------------------
+            logger.info(f"🛡️ Schritt 2: Technische & Semantische Validierung (XSD/KoSIT) für {transaction_id}")
+            step2_start = time.time()
+
+            # 2.1 XSD Validierung
+            xsd_failed = _execute_validation_step(
+                db, validation_report, "structure_validation_xsd", 
+                "Validierung gegen EN 16931 XSD Schema",
+                lambda: validate_xsd(xml_bytes, detected_format)
+            )
+
+            # Prüfe auf fatale Fehler (z.B. XML Syntax Error) oder XSD Fehler
+            if validation_report.summary.has_fatal_errors or xsd_failed:
+                 logger.error(f"🛑 XSD Validierung fehlgeschlagen oder fataler Fehler. Breche Verarbeitung ab.")
+                 # Setze Level nur, wenn es noch nicht gesetzt wurde
+                 if transaction.validation_level_reached == ValidationLevel.NONE:
+                     transaction.validation_level_reached = ValidationLevel.FORMAT
+                 return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
+
+            transaction.validation_level_reached = ValidationLevel.STRUCTURE
+            db.commit()
+
+            # 2.2 KoSIT/Schematron Validierung
+            kosit_failed = _execute_validation_step(
+                db, validation_report, "semantic_validation_kosit", 
+                "Prüfung der Geschäftsregeln (KoSIT/Schematron)",
+                # Wir übergeben transaction_id für das temporäre Dateihandling
+                lambda: validate_kosit_schematron(xml_bytes, str(transaction.id))
+            )
+
+            # Prüfe auf Fehler (Warnungen werden toleriert, Fehler führen zum Abbruch)
+            if kosit_failed:
+                 logger.error(f"🛑 KoSIT Validierung fehlgeschlagen (Fehler gefunden). Breche Verarbeitung ab.")
+                 return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
+
+            transaction.validation_level_reached = ValidationLevel.SEMANTIC
+            step2_duration = time.time() - step2_start
+            _log_processing_step(db, transaction_id, "validation_step2", "completed", f"Schritt 2 Validierung abgeschlossen", duration=step2_duration)
+            db.commit()
 
             # --------------------------------------------------------------------
-            # SCHRITT 2: XML Mapping (Integration Sprint 2)
+            # SCHRITT 3: XML Mapping (Integration Sprint 2)
             # --------------------------------------------------------------------
-            logger.info(f"🗺️ Schritt 2: XML Mapping für {transaction_id}")
-            step2_start = time.time()
+            logger.info(f"🗺️ Schritt 3: XML Mapping für {transaction_id}")
+            step3_start = time.time()
             # Initialisierung kompatibel mit User-Schema
             mapping_step = ValidationStep(
                 step_name="xml_mapping",
@@ -202,7 +248,7 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             try:
                 canonical_invoice = map_xml_to_canonical(xml_bytes, detected_format)
                 
-                mapping_step.duration_seconds = time.time() - step2_start
+                mapping_step.duration_seconds = time.time() - step3_start
                 mapping_step.status = "SUCCESS"
                 mapping_step.metadata = {"invoice_number": canonical_invoice.invoice_number, "total_amount": str(canonical_invoice.payable_amount)}
                 validation_report.add_step(mapping_step)
@@ -217,7 +263,7 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
                 # Mapping fehlgeschlagen (Geschäftslogik-Fehler) -> Status INVALID, kein Retry.
                 logger.error(f"🛑 Mapping Error für {transaction_id}: {e}")
                 
-                mapping_step.duration_seconds = time.time() - step2_start
+                mapping_step.duration_seconds = time.time() - step3_start
                 # Kompatibel mit User-Schema: Fehler direkt hinzufügen
                 mapping_step.errors.append(ValidationError(
                     message=str(e),
@@ -265,6 +311,84 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
 
 
 # --- Hilfsfunktionen ---
+
+def _execute_validation_step(
+    db: Session,
+    validation_report: ValidationReport,
+    step_name: str,
+    step_description: str,
+    validation_func
+) -> bool:
+    """
+    Führt einen Validierungsschritt aus und fügt das Ergebnis zum ValidationReport hinzu.
+    
+    Returns:
+        bool: True wenn der Schritt fehlgeschlagen ist (Fehler gefunden), False wenn erfolgreich
+    """
+    step_start_time = time.time()
+    
+    # Initialisiere den Validierungsschritt
+    validation_step = ValidationStep(
+        step_name=step_name,
+        step_description=step_description,
+        status="FAILED"  # Default auf FAILED
+    )
+    
+    try:
+        # Führe die Validierungsfunktion aus
+        validation_errors = validation_func()
+        
+        # Verarbeite die Ergebnisse
+        has_fatal_errors = False
+        has_errors = False
+        has_warnings = False
+        
+        for error in validation_errors:
+            if error.severity == ValidationSeverity.FATAL:
+                has_fatal_errors = True
+                validation_step.errors.append(error)
+            elif error.severity == ValidationSeverity.ERROR:
+                has_errors = True
+                validation_step.errors.append(error)
+            elif error.severity in [ValidationSeverity.WARNING, ValidationSeverity.INFO]:
+                has_warnings = True
+                validation_step.warnings.append(error)
+        
+        # Bestimme den Status
+        if has_fatal_errors or has_errors:
+            validation_step.status = "FAILED"
+        elif has_warnings:
+            validation_step.status = "WARNING"
+        else:
+            validation_step.status = "SUCCESS"
+            
+        # Berechne die Dauer
+        validation_step.duration_seconds = time.time() - step_start_time
+        
+        # Füge den Schritt zum Report hinzu
+        validation_report.add_step(validation_step)
+        
+        # Logge das Ergebnis
+        error_count = len(validation_step.errors)
+        warning_count = len(validation_step.warnings)
+        logger.info(f"✅ Validierungsschritt '{step_name}' abgeschlossen: {error_count} Fehler, {warning_count} Warnungen")
+        
+        # Gib True zurück wenn es Fehler gab (für Workflow-Kontrolle)
+        return has_fatal_errors or has_errors
+        
+    except Exception as e:
+        # Unerwarteter Fehler während der Validierung
+        validation_step.duration_seconds = time.time() - step_start_time
+        validation_step.errors.append(ValidationError(
+            message=f"Systemfehler während der Validierung: {str(e)}",
+            category=ValidationCategory.SYSTEM,
+            severity=ValidationSeverity.FATAL,
+            code="VALIDATION_SYSTEM_ERROR"
+        ))
+        validation_report.add_step(validation_step)
+        
+        logger.error(f"❌ Systemfehler in Validierungsschritt '{step_name}': {e}", exc_info=True)
+        return True  # Fehler aufgetreten
 
 def _finalize_processing(db: Session, transaction: InvoiceTransaction, status: TransactionStatus, report: ValidationReport, start_time: float) -> Dict[str, Any]:
     """

@@ -50,16 +50,19 @@ Das Projekt wird in 6 Sprints (12 Wochen) entwickelt:
 ## Aktuelle Phase
 
 ✅ **Sprint 0: Foundation Setup** - Abgeschlossen  
-✅ **Sprint 1: Ingestion Service** - Abgeschlossen
+✅ **Sprint 1: Ingestion Service** - Abgeschlossen (inkl. E-Mail Integration)
 ✅ **Sprint 2: Format & Extraction** - Abgeschlossen und integriert!
+✅ **Testing & Stabilisierung** - Abgeschlossen (93/93 Tests ✅)
 🎯 **Sprint 3: Core Validation** - Bereit zum Start!
 
 ### Aktuelle Highlights:
 - ✅ **End-to-End Workflow**: Upload → Format Detection → XML Extraction → Canonical Mapping
-- ✅ **PDF-Extraktion**: ZUGFeRD/Factur-X XML aus PDF/A-3 Dokumenten
+- ✅ **E-Mail Ingestion**: Automatische IMAP-Überwachung mit Anhang-Extraktion
+- ✅ **PDF-Extraktion**: ZUGFeRD/Factur-X XML aus PDF/A-3 Dokumenten (pypdf modernisiert)
 - ✅ **XML-Mapping**: CII & UBL → Canonical Model mit EN 16931 Compliance
+- ✅ **Pydantic V2**: Vollständige Migration mit kritischen Bugfixes
+- ✅ **Testing Framework**: 93 Tests, Corpus-Integration, CI/CD-ready
 - ✅ **Async/Sync Integration**: Saubere Trennung FastAPI (async) ↔ Celery (sync)
 - ✅ **Robuste Fehlerbehandlung**: Transiente vs. permanente Fehler mit Retry-Logic
-- ✅ **Workflow-Steuerung**: Automatische Manual Review bei nicht-strukturierten Daten
 
 Siehe [CHANGELOG.md](./CHANGELOG.md) für detaillierte Entwicklungsfortschritte.

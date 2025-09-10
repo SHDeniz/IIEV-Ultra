@@ -56,10 +56,29 @@ def map_ubl_to_canonical(root: etree._Element) -> CanonicalInvoice:
     buyer = _map_party(root, 'AccountingCustomerParty')
 
     # 3. Summen (LegalMonetaryTotal oder RequestedMonetaryTotal)
-    monetary_total_tag = 'LegalMonetaryTotal' if root_tag == 'Invoice' else 'RequestedMonetaryTotal'
-    monetary_total = xp(root, f'./cac:{monetary_total_tag}', NSMAP_UBL)
+    
+    # Standard Logik für Invoice
+    monetary_total_tag = 'LegalMonetaryTotal'
+    monetary_total = None
+
+    if root_tag == 'Invoice':
+        monetary_total = xp(root, f'./cac:{monetary_total_tag}', NSMAP_UBL)
+    
+    elif root_tag == 'CreditNote':
+        # Priorisiere RequestedMonetaryTotal für CreditNotes
+        monetary_total_tag = 'RequestedMonetaryTotal'
+        monetary_total = xp(root, f'./cac:{monetary_total_tag}', NSMAP_UBL)
+        
+        # KORREKTUR: Fallback auf LegalMonetaryTotal, falls RequestedMonetaryTotal fehlt
+        if monetary_total is None:
+            logger.warning("RequestedMonetaryTotal fehlt in CreditNote. Verwende Fallback auf LegalMonetaryTotal.")
+            monetary_total_tag = 'LegalMonetaryTotal'
+            monetary_total = xp(root, f'./cac:{monetary_total_tag}', NSMAP_UBL)
+
     if monetary_total is None:
-        raise MappingError(f"UBL Strukturfehler: cac:{monetary_total_tag} fehlt.")
+        # Wenn nach Fallback immer noch kein Total gefunden wurde, ist es ein Fehler.
+        # Wir verwenden den zuletzt versuchten Tag für die Fehlermeldung.
+        raise MappingError(f"UBL Strukturfehler: Kein gültiges MonetaryTotal Element gefunden (Zuletzt gesucht: cac:{monetary_total_tag}).")
 
     line_extension_amount = xp_decimal(monetary_total, './cbc:LineExtensionAmount', NSMAP_UBL, mandatory=True)
     tax_exclusive_amount = xp_decimal(monetary_total, './cbc:TaxExclusiveAmount', NSMAP_UBL, mandatory=True)

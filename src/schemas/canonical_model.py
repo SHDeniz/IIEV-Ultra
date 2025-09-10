@@ -56,6 +56,7 @@ class TaxCategory(str, Enum):
     ZERO_RATE = "Z"      # Zero rate
     EXEMPT = "E"         # Exempt from tax
     REVERSE_CHARGE = "AE"  # Reverse charge
+    INTRA_COMMUNITY_SUPPLY = "K" # VAT exempt for EEA intra-community supply
     NOT_SUBJECT = "O"    # Not subject to tax
 
 
@@ -168,8 +169,8 @@ class TaxBreakdown(BaseModel):
     """Steueraufschlüsselung"""
     tax_category: TaxCategory
     tax_rate: Decimal = Field(..., ge=0, le=100)  # Prozent
-    taxable_amount: Decimal = Field(..., ge=0)
-    tax_amount: Decimal = Field(..., ge=0)
+    taxable_amount: Decimal
+    tax_amount: Decimal
     
     @field_validator('tax_amount')
     @classmethod
@@ -194,12 +195,12 @@ class InvoiceLine(BaseModel):
     item_classification: Optional[str] = None  # z.B. UNSPSC Code
     
     # Mengen und Einheiten
-    quantity: Decimal = Field(..., gt=0)
+    quantity: Decimal
     unit_code: str = Field(default="C62")  # UN/ECE Rec 20 (C62 = Stück)
     
     # Preise
     unit_price: Decimal = Field(..., ge=0)
-    line_net_amount: Decimal = Field(..., ge=0)
+    line_net_amount: Decimal
     
     # Rabatte/Zuschläge
     allowance_charge_amount: Optional[Decimal] = Field(None, ge=0)
@@ -254,12 +255,12 @@ class CanonicalInvoice(BaseModel):
     lines: List[InvoiceLine] = Field(..., min_length=1)
     
     # Summen (WICHTIG: Immer Decimal!)
-    line_extension_amount: Decimal = Field(..., ge=0)  # Summe Netto-Zeilenbeträge
-    allowance_total_amount: Optional[Decimal] = Field(None, ge=0)  # Gesamtrabatt
+    line_extension_amount: Decimal  # Summe Netto-Zeilenbeträge
+    allowance_total_amount: Optional[Decimal]  # Gesamtrabatt
     charge_total_amount: Optional[Decimal] = Field(None, ge=0)     # Gesamtzuschlag
-    tax_exclusive_amount: Decimal = Field(..., ge=0)              # Nettosumme
-    tax_inclusive_amount: Decimal = Field(..., ge=0)              # Bruttosumme
-    payable_amount: Decimal = Field(..., ge=0)                    # Zahlbetrag
+    tax_exclusive_amount: Decimal            # Nettosumme
+    tax_inclusive_amount: Decimal             # Bruttosumme
+    payable_amount: Decimal                    # Zahlbetrag
     
     # Steueraufschlüsselung
     tax_breakdown: List[TaxBreakdown] = Field(..., min_length=1)

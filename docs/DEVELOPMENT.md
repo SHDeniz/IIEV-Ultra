@@ -117,24 +117,36 @@ docker-compose up --build
 
 ## Testing
 
-### Unit Tests
+IIEV-Ultra verfügt über ein umfassendes Testing-Framework mit 93 Tests. Siehe [TESTING_GUIDE.md](./TESTING_GUIDE.md) für Details.
+
+### Tests ausführen
 
 ```bash
-# Alle Tests
-pytest
+# Alle Tests (empfohlen)
+python run_tests.py
 
-# Spezifische Tests
-pytest tests/test_upload.py
+# Spezifische Test-Kategorien
+python run_tests.py tests/unit/          # Unit-Tests
+python run_tests.py tests/integration/   # Integration-Tests
 
-# Mit Coverage
-pytest --cov=src --cov-report=html
+# Mit Coverage-Report
+python run_tests.py --cov=src --cov-report=html
+
+# Einzelne Tests
+python run_tests.py tests/unit/extraction/test_pdf_util.py::test_extract_zugferd
 ```
 
-### Integration Tests
+### Test-Struktur
 
-```bash
-# Mit Docker-Services
-pytest tests/integration/
+- **Unit-Tests**: Isolierte Komponenten (Extraction, Mapping)
+- **Integration-Tests**: End-to-End Celery Workflows  
+- **Corpus-Tests**: Offizielle ZUGFeRD/XRechnung Test-Daten
+- **Mocks & Fixtures**: Realistische Test-Szenarien ohne externe Abhängigkeiten
+
+### Test-Ergebnisse
+
+```
+========================= 93 passed in 2.21s =========================
 ```
 
 ### API Tests
@@ -146,6 +158,9 @@ curl -X POST http://localhost:8000/api/v1/upload \
 
 # Mit httpie
 http --form POST localhost:8000/api/v1/upload file@test_invoice.pdf
+
+# Status prüfen
+curl http://localhost:8000/api/v1/status/{transaction_id}
 ```
 
 ## Debugging

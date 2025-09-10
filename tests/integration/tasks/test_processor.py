@@ -2,6 +2,7 @@
 import pytest
 import uuid
 from decimal import Decimal
+from datetime import date
 from src.tasks.processor import process_invoice_task
 from src.db.models import InvoiceTransaction, TransactionStatus, InvoiceFormat
 from src.services.mapping.xpath_util import MappingError
@@ -33,6 +34,7 @@ class TestProcessorWorkflow:
         mock_canonical = MagicMock()
         mock_canonical.invoice_number = "R98765"
         mock_canonical.payable_amount = Decimal("100.00")
+        mock_canonical.issue_date = date(2025, 9, 10)
         # Patche den Aufruf im processor Modul
         mocker.patch('src.tasks.processor.map_xml_to_canonical', return_value=mock_canonical)
 
@@ -44,6 +46,7 @@ class TestProcessorWorkflow:
         assert result['status'] == TransactionStatus.MANUAL_REVIEW.value
         assert mock_transaction.status == TransactionStatus.MANUAL_REVIEW
         assert mock_transaction.format_detected == InvoiceFormat.XRECHNUNG_UBL
+        assert mock_transaction.issue_date is not None
         
         # Prüfe Aufrufe
         mock_sync_storage_service.download_blob_by_uri.assert_called_with("azure://raw/test.xml")

@@ -15,6 +15,8 @@ import traceback
 import time
 import os
 import uuid
+import hashlib
+from imap_tools import MailBox, AND, MailMessage
 
 from .worker import celery_app
 # Annahme: get_metadata_session existiert in db/session.py
@@ -376,11 +378,157 @@ def _log_processing_step(
 
 
 # --- Andere Tasks (E-Mail Monitoring etc.) ---
-# Platzhalter beibehalten
+
 @celery_app.task(name="email_monitoring_task")
 def email_monitoring_task() -> Dict[str, Any]:
-    logger.info("📧 E-Mail Monitoring Task (Platzhalter)")
-    return {"status": "skipped", "note": "Implementierung folgt"}
+    """
+    Periodischer Task zur Überwachung des E-Mail-Postfachs.
+    """
+    if not settings.EMAIL_INGESTION_ENABLED:
+        logger.info("📧 E-Mail Monitoring ist deaktiviert.")
+        return {"status": "disabled"}
+
+    if not all([settings.IMAP_HOST, settings.IMAP_USERNAME, settings.IMAP_PASSWORD]):
+        logger.error("❌ E-Mail Monitoring Konfiguration unvollständig.")
+        return {"status": "configuration_error"}
+
+    logger.info(f"📧 Starte E-Mail Monitoring für {settings.IMAP_USERNAME}@{settings.IMAP_HOST}...")
+    
+    processed_count = 0
+    error_count = 0
+
+    try:
+        # Verbinde zum IMAP Server (SSL/TLS wird standardmäßig verwendet)
+        with MailBox(settings.IMAP_HOST, settings.IMAP_PORT).login(settings.IMAP_USERNAME, settings.IMAP_PASSWORD, settings.IMAP_FOLDER_INBOX) as mailbox:
+            
+            # Suche nach ungelesenen E-Mails
+            uids = mailbox.uids(AND(seen=False))
+            logger.info(f"📬 {len(uids)} neue E-Mails gefunden.")
+
+            for uid in uids:
+                msg = None
+                try:
+                    # Hole E-Mail (mark_seen=False, um Datenverlust bei Absturz zu verhindern)
+                    msg = mailbox.fetch(uid, mark_seen=False)
+                    
+                    # Verarbeite Anhänge
+                    attachments_processed = _process_email_attachments(msg)
+                    
+                    if attachments_processed > 0:
+                        # Wenn erfolgreich verarbeitet: Verschiebe in Archiv und markiere als gelesen
+                        mailbox.move(uid, settings.IMAP_FOLDER_ARCHIVE)
+                        mailbox.seen(uid, True)
+                        processed_count += attachments_processed
+                    else:
+                        # Keine relevanten Anhänge: Markiere als gelesen
+                        logger.info(f"Keine relevanten Anhänge in E-Mail UID {uid}. Markiere als gelesen.")
+                        mailbox.seen(uid, True)
+
+                except Exception as e:
+                    # Fehler bei der Verarbeitung dieser E-Mail
+                    logger.error(f"❌ Fehler bei der Verarbeitung von E-Mail UID {uid} (Subject: {msg.subject if msg else 'N/A'}): {e}", exc_info=True)
+                    error_count += 1
+                    # Versuche in Error-Ordner zu verschieben
+                    try:
+                        mailbox.move(uid, settings.IMAP_FOLDER_ERROR)
+                        mailbox.seen(uid, True)
+                    except Exception as move_error:
+                        logger.error(f"Fehler beim Verschieben in Error-Ordner: {move_error}")
+
+    except Exception as e:
+        # Fehler bei der Verbindung zum IMAP Server
+        logger.error(f"❌ Kritischer Fehler beim E-Mail Monitoring (Verbindung/Login): {e}")
+        return {"status": "failed", "error": str(e)}
+
+    logger.info(f"✅ E-Mail Monitoring abgeschlossen. Verarbeitet: {processed_count}, Fehler: {error_count}.")
+    return {
+        "status": "completed",
+        "processed_attachments": processed_count,
+        "errors": error_count,
+    }
+
+
+def _process_email_attachments(msg: MailMessage) -> int:
+    """
+    Extrahiert Anhänge, speichert sie GoBD-konform und startet den Verarbeitungsprozess.
+    """
+    processed_count = 0
+    logger.info(f"📄 Verarbeite Anhänge von E-Mail: {msg.subject} (Von: {msg.from_})")
+
+    if sync_storage_service is None:
+        raise RuntimeError("SyncStorageService ist nicht verfügbar für E-Mail-Verarbeitung.")
+
+    for att in msg.attachments:
+        # Filter für relevante Dateitypen (PDF, XML)
+        if att.content_type not in ['application/pdf', 'application/xml', 'text/xml']:
+            logger.info(f"Skipping Anhang {att.filename} (Typ: {att.content_type})")
+            continue
+
+        logger.info(f"Processing Anhang: {att.filename} ({len(att.payload)} bytes)")
+        
+        # Initialisiere DB Session
+        db = None
+        storage_uri = None
+        try:
+            # Wir müssen hier eine Session öffnen, da wir außerhalb des Contexts von process_invoice_task sind.
+            # Verwenden Sie die Funktion, die in db/session.py definiert ist.
+            db = get_metadata_session() 
+            with db: # Nutze Session als Context Manager
+                # 1. Erstelle neue Transaction in der Datenbank
+                transaction = InvoiceTransaction(
+                    status=TransactionStatus.RECEIVED,
+                    original_filename=att.filename,
+                    file_size_bytes=len(att.payload),
+                    content_type=att.content_type,
+                    # Metadaten zur Quelle
+                    error_details={"source": "EMAIL", "email_subject": msg.subject, "email_from": msg.from_}
+                )
+                db.add(transaction)
+                db.commit()
+                transaction_id = str(transaction.id) 
+                
+                # 2. Speichere Anhang im Raw Storage (GoBD-konform)
+                # Blob Name Konvention (transaction_id/filename)
+                blob_name = f"{transaction_id}/{att.filename}"
+                
+                # Direkter Upload mit dem synchronen Service Client
+                blob_client = sync_storage_service.blob_service_client.get_blob_client(
+                    container=sync_storage_service.raw_container_name,
+                    blob=blob_name
+                )
+                
+                metadata = {
+                   "transaction_id": transaction_id,
+                   "source": "EMAIL",
+                   "content_hash": hashlib.sha256(att.payload).hexdigest(),
+                }
+                
+                # Synchroner Upload
+                blob_client.upload_blob(att.payload, overwrite=True, metadata=metadata)
+                storage_uri = blob_client.url
+
+                # 3. Aktualisiere Transaction mit Storage URI
+                transaction.storage_uri_raw = storage_uri
+                db.commit()
+
+                # 4. Starte asynchronen Verarbeitungsprozess
+                process_invoice_task.delay(transaction_id)
+                logger.info(f"🚀 Verarbeitung gestartet für Anhang {att.filename} (Transaction ID: {transaction_id})")
+                processed_count += 1
+
+        except Exception as e:
+            logger.error(f"❌ Fehler bei der Verarbeitung des Anhangs {att.filename}: {e}", exc_info=True)
+            if db:
+                try:
+                    db.rollback()
+                except:
+                    pass
+            if storage_uri:
+                 logger.critical(f"Inkonsistenz! Datei hochgeladen ({storage_uri}), aber DB-Transaktion fehlgeschlagen.")
+            raise # Werfe Fehler weiter, damit die E-Mail als fehlerhaft markiert wird
+
+    return processed_count
+
 
 @celery_app.task(name="cleanup_old_results_task")
 def cleanup_old_results_task() -> Dict[str, Any]:

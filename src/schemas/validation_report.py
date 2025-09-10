@@ -3,7 +3,7 @@ Pydantic Modelle für Validierungsberichte
 Strukturierte Darstellung aller Validierungsergebnisse
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -39,8 +39,8 @@ class ValidationError(BaseModel):
     actual_value: Optional[str] = None
     suggestion: Optional[str] = None     # Lösungsvorschlag
     
-    class Config:
-        schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra = {
             "example": {
                 "category": "SEMANTIC",
                 "severity": "ERROR",
@@ -53,13 +53,14 @@ class ValidationError(BaseModel):
                 "suggestion": "Correct the total amount or review individual line calculations"
             }
         }
+    )
 
 
 class ValidationStep(BaseModel):
     """Einzelner Validierungsschritt"""
     step_name: str
     step_description: Optional[str] = None
-    status: str = Field(..., regex="^(SUCCESS|FAILED|SKIPPED|WARNING)$")
+    status: str = Field(..., pattern="^(SUCCESS|FAILED|SKIPPED|WARNING)$")
     duration_seconds: Optional[float] = None
     errors: List[ValidationError] = Field(default_factory=list)
     warnings: List[ValidationError] = Field(default_factory=list)
@@ -214,8 +215,8 @@ class ValidationReport(BaseModel):
             "duration_seconds": self.total_duration_seconds
         }
     
-    class Config:
-        schema_extra = {
+    class ConfigDict:
+        json_schema_extra = {
             "example": {
                 "transaction_id": "550e8400-e29b-41d4-a716-446655440000",
                 "invoice_number": "R2024-001",

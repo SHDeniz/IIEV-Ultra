@@ -4,7 +4,7 @@ Das zentrale, einheitliche Rechnungsmodell für alle Formate (UBL, CII)
 WICHTIG: Immer Decimal für Währungen verwenden, niemals float!
 """
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from datetime import date
 from decimal import Decimal
 from typing import Optional, List
@@ -86,7 +86,9 @@ class Party(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     
     # Steuerliche Identifikation
-    vat_id: Optional[str] = Field(None, regex=r"^[A-Z]{2}[A-Z0-9]{2,12}$")  # USt-IdNr.
+    # ALT (V1): vat_id: Optional[str] = Field(None, regex=r"^[A-Z]{2}[A-Z0-9]{2,12}$")
+    # NEU (V2): Ersetze regex durch pattern
+    vat_id: Optional[str] = Field(None, pattern=r"^[A-Z]{2}[A-Z0-9]{2,12}$")  # USt-IdNr.
     tax_id: Optional[str] = None  # Steuernummer
     
     # Adresse
@@ -117,7 +119,7 @@ class Party(BaseModel):
 class BankDetails(BaseModel):
     """Bankverbindung für Zahlungen"""
     iban: str = Field(..., min_length=15, max_length=34)  # IBAN Länge variiert je nach Land
-    bic: Optional[str] = Field(None, regex=r"^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$")
+    bic: Optional[str] = Field(None, pattern=r"^[A-Z]{6}[A-Z0-9]{2}([A-Z0-9]{3})?$")
     account_name: Optional[str] = None
     bank_name: Optional[str] = None
     
@@ -249,7 +251,7 @@ class CanonicalInvoice(BaseModel):
     buyer: Party
     
     # Rechnungszeilen
-    lines: List[InvoiceLine] = Field(..., min_items=1)
+    lines: List[InvoiceLine] = Field(..., min_length=1)
     
     # Summen (WICHTIG: Immer Decimal!)
     line_extension_amount: Decimal = Field(..., ge=0)  # Summe Netto-Zeilenbeträge
@@ -260,7 +262,7 @@ class CanonicalInvoice(BaseModel):
     payable_amount: Decimal = Field(..., ge=0)                    # Zahlbetrag
     
     # Steueraufschlüsselung
-    tax_breakdown: List[TaxBreakdown] = Field(..., min_items=1)
+    tax_breakdown: List[TaxBreakdown] = Field(..., min_length=1)
     
     # Zahlungsinformationen
     payment_terms: Optional[PaymentTerms] = None
@@ -319,9 +321,9 @@ class CanonicalInvoice(BaseModel):
             return None
         return max(tax.tax_rate for tax in self.tax_breakdown)
     
-    class Config:
+    class ConfigDict:
         # JSON Schema Generation
-        schema_extra = {
+        json_schema_extra = {
             "example": {
                 "invoice_number": "R2024-001",
                 "issue_date": "2024-01-15",

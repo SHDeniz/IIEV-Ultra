@@ -312,84 +312,63 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
 
 # --- Hilfsfunktionen ---
 
-def _execute_validation_step(
-    db: Session,
-    validation_report: ValidationReport,
-    step_name: str,
-    step_description: str,
-    validation_func
-) -> bool:
+def _execute_validation_step(db: Session, report: ValidationReport, step_name: str, description: str, validation_func) -> bool:
     """
-    Führt einen Validierungsschritt aus und fügt das Ergebnis zum ValidationReport hinzu.
-    
-    Returns:
-        bool: True wenn der Schritt fehlgeschlagen ist (Fehler gefunden), False wenn erfolgreich
+    Führt eine Validierungsfunktion aus, protokolliert die Ergebnisse und aktualisiert den Report.
+    Gibt True zurück, wenn Fehler (ERROR/FATAL) gefunden wurden (Failed), sonst False.
     """
-    step_start_time = time.time()
-    
-    # Initialisiere den Validierungsschritt
-    validation_step = ValidationStep(
+    start_time = time.time()
+    step = ValidationStep(
         step_name=step_name,
-        step_description=step_description,
-        status="FAILED"  # Default auf FAILED
+        step_description=description,
+        status="FAILED" # Default Status
     )
     
+    validation_failed = False
     try:
-        # Führe die Validierungsfunktion aus
-        validation_errors = validation_func()
+        # Führe die Validierungslogik aus (erwartet Liste von ValidationErrors)
+        results = validation_func()
         
-        # Verarbeite die Ergebnisse
-        has_fatal_errors = False
-        has_errors = False
-        has_warnings = False
+        # Trenne Ergebnisse nach Schweregrad (kompatibel mit User-Schema)
+        for item in results:
+            if item.severity in [ValidationSeverity.FATAL, ValidationSeverity.ERROR]:
+                step.errors.append(item)
+                validation_failed = True
+            else:
+                step.warnings.append(item)
         
-        for error in validation_errors:
-            if error.severity == ValidationSeverity.FATAL:
-                has_fatal_errors = True
-                validation_step.errors.append(error)
-            elif error.severity == ValidationSeverity.ERROR:
-                has_errors = True
-                validation_step.errors.append(error)
-            elif error.severity in [ValidationSeverity.WARNING, ValidationSeverity.INFO]:
-                has_warnings = True
-                validation_step.warnings.append(error)
-        
-        # Bestimme den Status
-        if has_fatal_errors or has_errors:
-            validation_step.status = "FAILED"
-        elif has_warnings:
-            validation_step.status = "WARNING"
+        # Setze Status basierend auf Fehlern (nicht Warnungen)
+        if not validation_failed:
+            step.status = "SUCCESS"
+            status_msg = "erfolgreich"
         else:
-            validation_step.status = "SUCCESS"
-            
-        # Berechne die Dauer
-        validation_step.duration_seconds = time.time() - step_start_time
-        
-        # Füge den Schritt zum Report hinzu
-        validation_report.add_step(validation_step)
-        
-        # Logge das Ergebnis
-        error_count = len(validation_step.errors)
-        warning_count = len(validation_step.warnings)
-        logger.info(f"✅ Validierungsschritt '{step_name}' abgeschlossen: {error_count} Fehler, {warning_count} Warnungen")
-        
-        # Gib True zurück wenn es Fehler gab (für Workflow-Kontrolle)
-        return has_fatal_errors or has_errors
-        
+            status_msg = "fehlgeschlagen"
+
+        _log_processing_step(
+            db, str(report.transaction_id), step_name, status_msg, 
+            f"{description} abgeschlossen. Fehler: {len(step.errors)}, Warnungen: {len(step.warnings)}."
+        )
+
     except Exception as e:
-        # Unerwarteter Fehler während der Validierung
-        validation_step.duration_seconds = time.time() - step_start_time
-        validation_step.errors.append(ValidationError(
-            message=f"Systemfehler während der Validierung: {str(e)}",
+        # Fange Systemfehler während der Validierung ab (z.B. Timeout, JRE nicht gefunden)
+        logger.error(f"❌ Systemfehler während Validierungsschritt {step_name}: {e}", exc_info=True)
+        validation_failed = True
+        step.errors.append(ValidationError(
             category=ValidationCategory.SYSTEM,
             severity=ValidationSeverity.FATAL,
-            code="VALIDATION_SYSTEM_ERROR"
+            message=f"Systemfehler während der Ausführung: {e}",
+            code=f"{step_name.upper()}_EXECUTION_FAILED"
         ))
-        validation_report.add_step(validation_step)
-        
-        logger.error(f"❌ Systemfehler in Validierungsschritt '{step_name}': {e}", exc_info=True)
-        return True  # Fehler aufgetreten
+        _log_processing_step(db, str(report.transaction_id), step_name, "failed", f"Systemfehler: {e}")
 
+    finally:
+        step.duration_seconds = time.time() - start_time
+        report.add_step(step)
+        # Wichtig: Summary aktualisieren, damit has_fatal_errors korrekt ist
+        report._update_summary()
+    
+    return validation_failed
+    
 def _finalize_processing(db: Session, transaction: InvoiceTransaction, status: TransactionStatus, report: ValidationReport, start_time: float) -> Dict[str, Any]:
     """
     Schließt die Verarbeitung ab, aktualisiert den Status und speichert das Ergebnis.

@@ -39,7 +39,7 @@ def validate_xsd(xml_bytes: bytes, format: InvoiceFormat) -> list[ValidationErro
     
     if not xsd_path:
         errors.append(ValidationError(
-            category=ValidationCategory.SYSTEM, severity=ValidationSeverity.FATAL,
+            category=ValidationCategory.TECHNICAL, severity=ValidationSeverity.FATAL,
             message=f"Kein XSD Schema für Format {format.value} gefunden oder konfiguriert.", code="XSD_SCHEMA_MISSING"
         ))
         return errors
@@ -47,7 +47,7 @@ def validate_xsd(xml_bytes: bytes, format: InvoiceFormat) -> list[ValidationErro
     xmlschema = _load_schema(xsd_path)
     if not xmlschema:
         errors.append(ValidationError(
-            category=ValidationCategory.SYSTEM, severity=ValidationSeverity.FATAL,
+            category=ValidationCategory.TECHNICAL, severity=ValidationSeverity.FATAL,
             message=f"XSD Schema konnte nicht kompiliert werden: {xsd_path.name}", code="XSD_SCHEMA_INVALID"
         ))
         return errors

@@ -256,3 +256,71 @@ def get_corpus_files(subdir: str) -> List[pytest.param]:
 UBL_CORPUS_FILES = get_corpus_files("ubl")
 CII_CORPUS_FILES = get_corpus_files("cii")
 ZUGFERD_CORPUS_FILES = get_corpus_files("zugferd")
+
+# ------------------------------------------------------------------------
+# Invalide XML Daten für Validierungstests
+# ------------------------------------------------------------------------
+
+from src.schemas.canonical_model import CanonicalInvoice, Party, Address, InvoiceLine, TaxBreakdown, CurrencyCode, CountryCode, TaxCategory
+from datetime import date
+
+# Strukturell Invalide UBL (XSD Fehler): Fehlendes Pflichtfeld (LegalMonetaryTotal)
+INVALID_XSD_UBL_XML = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2"
+         xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2"
+         xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2">
+    <cbc:ID>I-INVALID-XSD</cbc:ID>
+    <cbc:IssueDate>2025-09-10</cbc:IssueDate>
+    <cbc:InvoiceTypeCode>380</cbc:InvoiceTypeCode>
+    <cbc:DocumentCurrencyCode>EUR</cbc:DocumentCurrencyCode>
+    </Invoice>
+"""
+
+# Semantisch Invalide UBL (KoSIT/Schematron Fehler): Ungültiger Ländercode
+# Wir nutzen das valide UBL Beispiel (MINIMAL_UBL_XML) und ändern nur den Ländercode von DE zu XX.
+# Stellen Sie sicher, dass MINIMAL_UBL_XML in conftest.py definiert ist.
+INVALID_SEMANTIC_UBL_XML = MINIMAL_UBL_XML.replace(
+    '<cbc:IdentificationCode>DE</cbc:IdentificationCode>', 
+    '<cbc:IdentificationCode>XX</cbc:IdentificationCode>'
+)
+
+@pytest.fixture
+def invalid_xsd_ubl_bytes():
+    return INVALID_XSD_UBL_XML.encode('utf-8')
+
+@pytest.fixture
+def invalid_semantic_ubl_bytes():
+    # Nutzt die manipulierte Version für KoSIT Tests
+    return INVALID_SEMANTIC_UBL_XML.encode('utf-8')
+
+# ------------------------------------------------------------------------
+# CanonicalInvoice Fixtures für Calculation Tests
+# ------------------------------------------------------------------------
+
+@pytest.fixture
+def base_canonical_invoice() -> CanonicalInvoice:
+    """Erstellt eine mathematisch korrekte Basis CanonicalInvoice zum Modifizieren in Tests."""
+    seller = Party(name="Seller", vat_id="DE123456789", address=Address(city_name="Berlin", postal_zone="10115", country_code=CountryCode.DE))
+    buyer = Party(name="Buyer", address=Address(city_name="Munich", postal_zone="80331", country_code=CountryCode.DE))
+    
+    # Basis-Setup: 1 Position (100 Netto), 19% Steuer (19), Gesamt (119)
+    line = InvoiceLine(line_id="1", item_name="Service", quantity=Decimal("1"), unit_code="C62", unit_price=Decimal("100.00"), line_net_amount=Decimal("100.00"), tax_rate=Decimal("19.00"), tax_category=TaxCategory.STANDARD_RATE)
+    tax = TaxBreakdown(tax_category=TaxCategory.STANDARD_RATE, tax_rate=Decimal("19.00"), taxable_amount=Decimal("100.00"), tax_amount=Decimal("19.00"))
+
+    return CanonicalInvoice(
+        invoice_number="C-TEST-1",
+        issue_date=date(2025, 9, 11),
+        invoice_type_code="380",
+        currency_code=CurrencyCode.EUR,
+        seller=seller,
+        buyer=buyer,
+        lines=[line],
+        tax_breakdown=[tax],
+        line_extension_amount=Decimal("100.00"),
+        tax_exclusive_amount=Decimal("100.00"),
+        tax_inclusive_amount=Decimal("119.00"),
+        payable_amount=Decimal("119.00"),
+        allowance_total_amount=Decimal("0.00"),
+        charge_total_amount=Decimal("0.00"),
+        payment_details=[]
+    )

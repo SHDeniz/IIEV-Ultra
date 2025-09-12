@@ -205,7 +205,7 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             )
 
             # Prüfe auf fatale Fehler (z.B. XML Syntax Error) oder XSD Fehler
-            if validation_report.summary.has_fatal_errors or xsd_failed:
+            if validation_report.has_fatal_errors() or xsd_failed:
                  logger.error(f"🛑 XSD Validierung fehlgeschlagen oder fataler Fehler. Breche Verarbeitung ab.")
                  # Setze Level nur, wenn es noch nicht gesetzt wurde
                  if transaction.validation_level_reached == ValidationLevel.NONE:
@@ -278,24 +278,40 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
                 # Workflow hier beenden und Status auf INVALID setzen
                 return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
 
+            # --------------------------------------------------------------------
+            # SCHRITT 4: Mathematische Validierung (Sprint 3)
+            # --------------------------------------------------------------------
+            logger.info(f"🧮 Schritt 4: Mathematische Validierung für {transaction_id}")
+            step4_start = time.time()
+
+            # canonical_invoice muss hier existieren.
+            calc_failed = _execute_validation_step(
+                db, validation_report, "calculation_validation", 
+                "Mathematische Prüfung der Summen und Steuern",
+                lambda: validate_calculations(canonical_invoice)
+            )
+
+            # Prüfe auf Fehler
+            if calc_failed:
+                 logger.error(f"🛑 Mathematische Validierung fehlgeschlagen. Breche Verarbeitung ab.")
+                 return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
+
+            step4_duration = time.time() - step4_start
+            _log_processing_step(db, transaction_id, "calculation_validation", "completed", "Mathematische Validierung abgeschlossen", duration=step4_duration)
+            transaction.validation_level_reached = ValidationLevel.COMPLIANCE
+            db.commit()
+
 
             # --------------------------------------------------------------------
-            # SCHRITT 3, 4, 5: Validierung (Placeholder für Sprints 3-5)
+            # SCHRITT 5: Business Validierung (Placeholder für Sprint 4/5)
             # --------------------------------------------------------------------
-            # Diese Schritte arbeiten nun mit dem `canonical_invoice` Objekt.
-
-            logger.info(f"🔍 Schritte 3-5: Validierung (Platzhalter)")
-            # Placeholder Logik kompatibel mit User-Schema
-            validation_report.add_step(ValidationStep(step_name="structure_validation", status="SKIPPED"))
-            validation_report.add_step(ValidationStep(step_name="semantic_validation", status="SKIPPED"))
-            validation_report.add_step(ValidationStep(step_name="business_validation", status="SKIPPED"))
+            logger.info(f"🏢 Schritt 5: Business Validierung (ERP) - Platzhalter")
+            validation_report.add_step(ValidationStep(step_name="business_validation_erp", status="SKIPPED"))
 
 
-            # VORLÄUFIGER STATUS: Wenn Mapping erfolgreich war, aber Validierung noch fehlt.
-            final_status = TransactionStatus.MANUAL_REVIEW # Sicherer Default
-            transaction.validation_level_reached = ValidationLevel.STRUCTURE # Mapping erfolgreich
-
-            return _finalize_processing(db, transaction, final_status, validation_report, start_time)
+            # FINALER STATUS
+            # Wir übergeben None, damit _finalize_processing den Status automatisch bestimmt.
+            return _finalize_processing(db, transaction, None, validation_report, start_time)
             
     except Exception as e:
         # Generelle Fehlerbehandlung für Systemfehler (Retry durch Celery)
@@ -369,24 +385,39 @@ def _execute_validation_step(db: Session, report: ValidationReport, step_name: s
     
     return validation_failed
     
-def _finalize_processing(db: Session, transaction: InvoiceTransaction, status: TransactionStatus, report: ValidationReport, start_time: float) -> Dict[str, Any]:
+def _finalize_processing(db: Session, transaction: InvoiceTransaction, explicit_status: Optional[TransactionStatus], report: ValidationReport, start_time: float) -> Dict[str, Any]:
     """
-    Schließt die Verarbeitung ab, aktualisiert den Status und speichert das Ergebnis.
+    Schließt die Verarbeitung ab. Bestimmt den finalen Status, wenn nicht explizit gesetzt.
     """
     processing_time = time.time() - start_time
     
-    transaction.status = status
-    
-    # Aktualisiere den Summary Report (wichtig in der User-Struktur)
+    # Aktualisiere den Summary Report final
     report._update_summary()
     report.total_duration_seconds = processing_time
 
-    # Pydantic V2 Kompatibilität: Verwende model_dump() falls verfügbar, sonst dict()
+    # Bestimme den finalen Status
+    if explicit_status:
+        status = explicit_status
+    else:
+        # Logik für automatische Statusbestimmung basierend auf Report
+        if report.has_fatal_errors() or report.summary.total_errors > 0:
+            status = TransactionStatus.INVALID
+            logger.info("❌ Verarbeitung abgeschlossen mit Fehlern. Status: INVALID.")
+        elif report.summary.total_warnings > 0:
+            status = TransactionStatus.MANUAL_REVIEW
+            logger.info("✅ Verarbeitung erfolgreich, aber Warnungen vorhanden. Status: MANUAL_REVIEW.")
+        else:
+            # Vorläufig VALID, bis Sprint 5 (ERP Integration) abgeschlossen ist.
+            status = TransactionStatus.VALID
+            logger.info("✅ Verarbeitung erfolgreich. Keine Fehler oder Warnungen. Status: VALID.")
+
+    transaction.status = status
+
+    # Pydantic V2: model_dump(mode='json')
     try:
-        # Versuche V2 model_dump für JSON-kompatible Ausgabe
         transaction.validation_report = report.model_dump(mode='json')
     except AttributeError:
-        # Fallback für Pydantic V1
+        # Fallback für Pydantic V1 (falls Migration nicht vollständig)
         transaction.validation_report = report.dict()
 
     transaction.processing_time_seconds = processing_time
@@ -406,7 +437,6 @@ def _finalize_processing(db: Session, transaction: InvoiceTransaction, status: T
         "transaction_id": str(transaction.id),
         "status": status.value,
         "processing_time_seconds": processing_time,
-        # Nutze die Methode aus dem User-Modell
         "validation_summary": report.to_json_summary(),
     }
 

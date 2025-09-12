@@ -1,4 +1,4 @@
-# tests/integration/tasks/test_processor.py
+# tests/integration/tasks/test_processor.py (Vollständig aktualisiert)
 import pytest
 import uuid
 from decimal import Decimal
@@ -8,17 +8,30 @@ from src.db.models import InvoiceTransaction, TransactionStatus, InvoiceFormat
 from src.services.mapping.xpath_util import MappingError
 from unittest.mock import MagicMock
 
+# Importiere ValidationError, um Fehler simulieren zu können
+from src.schemas.validation_report import ValidationError, ValidationCategory, ValidationSeverity
+
 # Wir nutzen die Mocks (mock_db_session, mock_sync_storage_service) aus conftest.py
 
 class TestProcessorWorkflow:
 
-    def test_process_happy_path_ubl(self, mock_db_session, mock_sync_storage_service, minimal_ubl_bytes, mocker):
-        """Testet den erfolgreichen Workflow für eine UBL Rechnung."""
+    @pytest.fixture(autouse=True)
+    def setup_mocks(self, mocker):
+        """Mockt alle Validierungsfunktionen und das Mapping für Workflow-Tests."""
+        # Mocke XSD, KoSIT und Calculation, um JRE/Asset Abhängigkeiten zu entfernen.
+        self.mock_xsd = mocker.patch('src.tasks.processor.validate_xsd', return_value=[])
+        self.mock_kosit = mocker.patch('src.tasks.processor.validate_kosit_schematron', return_value=[])
+        self.mock_calc = mocker.patch('src.tasks.processor.validate_calculations', return_value=[])
+        # Mocke auch das Mapping.
+        self.mock_mapper = mocker.patch('src.tasks.processor.map_xml_to_canonical')
+
+    def test_process_happy_path_ubl(self, mock_db_session, mock_sync_storage_service, minimal_ubl_bytes):
+        """Testet den erfolgreichen Workflow (VALID) wenn keine Fehler von Mocks gemeldet werden."""
         
         transaction_id = str(uuid.uuid4())
         session, query = mock_db_session
         
-        # 1. Setup DB Mock: Simuliere eine eingehende Transaktion
+        # 1. Setup DB Mock
         mock_transaction = InvoiceTransaction(
             id=transaction_id, 
             status=TransactionStatus.RECEIVED,
@@ -26,34 +39,60 @@ class TestProcessorWorkflow:
         )
         query.filter.return_value.first.return_value = mock_transaction
 
-        # 2. Setup Storage Mock: Liefere das UBL XML zurück
+        # 2. Setup Storage Mock
         mock_sync_storage_service.download_blob_by_uri.return_value = minimal_ubl_bytes
         
-        # 3. Setup Mapper Mock (Optional, aber schneller)
-        # Wir können das Mapping auch laufen lassen, da das XML valide ist. Hier mocken wir es für Isolation.
+        # 3. Setup Mapper Mock (Stelle sicher, dass alle notwendigen Attribute vorhanden sind)
         mock_canonical = MagicMock()
         mock_canonical.invoice_number = "R98765"
         mock_canonical.payable_amount = Decimal("100.00")
-        mock_canonical.issue_date = date(2025, 9, 10)
-        # Patche den Aufruf im processor Modul
-        mocker.patch('src.tasks.processor.map_xml_to_canonical', return_value=mock_canonical)
+        mock_canonical.currency_code = MagicMock(value="EUR") # Mock Enum access
+        mock_canonical.issue_date = date(2025, 9, 11)
+        mock_canonical.seller = MagicMock(name="Seller", vat_id="DE123")
+        mock_canonical.buyer = MagicMock(name="Buyer", vat_id="DE456")
+        mock_canonical.purchase_order_reference = None
+        
+        self.mock_mapper.return_value = mock_canonical
 
         # 4. Führe den Task aus
         result = process_invoice_task(transaction_id)
 
         # 5. Prüfe Ergebnisse
-        # Der Status ist MANUAL_REVIEW, da die Validierung (Sprints 3-5) noch fehlt.
-        assert result['status'] == TransactionStatus.MANUAL_REVIEW.value
-        assert mock_transaction.status == TransactionStatus.MANUAL_REVIEW
-        assert mock_transaction.format_detected == InvoiceFormat.XRECHNUNG_UBL
-        assert mock_transaction.issue_date is not None
+        # Da alle Validierungen gemockt sind und keine Fehler zurückgeben, sollte der Status VALID sein.
+        assert result['status'] == TransactionStatus.VALID.value
+        assert mock_transaction.status == TransactionStatus.VALID
         
-        # Prüfe Aufrufe
-        mock_sync_storage_service.download_blob_by_uri.assert_called_with("azure://raw/test.xml")
-        session.commit.assert_called()
+        # Prüfe, ob alle Schritte aufgerufen wurden
+        self.mock_xsd.assert_called()
+        self.mock_kosit.assert_called()
+        self.mock_mapper.assert_called()
+        self.mock_calc.assert_called()
 
-    def test_process_mapping_error(self, mock_db_session, mock_sync_storage_service, minimal_ubl_bytes, mocker):
-        """Testet den Workflow, wenn das Mapping fehlschlägt."""
+    def test_process_validation_error_flow(self, mock_db_session, mock_sync_storage_service, minimal_ubl_bytes):
+        """Testet den Workflow (INVALID), wenn eine Validierung einen Fehler meldet."""
+        
+        transaction_id = str(uuid.uuid4())
+        session, query = mock_db_session
+        mock_transaction = InvoiceTransaction(id=transaction_id, status=TransactionStatus.RECEIVED, storage_uri_raw="azure://raw/test.xml")
+        query.filter.return_value.first.return_value = mock_transaction
+        mock_sync_storage_service.download_blob_by_uri.return_value = minimal_ubl_bytes
+
+        # Simuliere einen Fehler bei der KoSIT Validierung
+        self.mock_kosit.return_value = [
+            ValidationError(category=ValidationCategory.SEMANTIC, severity=ValidationSeverity.ERROR, message="Test Error", code="TEST-1")
+        ]
+
+        # Führe den Task aus
+        result = process_invoice_task(transaction_id)
+
+        # Prüfe Ergebnisse
+        assert result['status'] == TransactionStatus.INVALID.value
+        
+        # Prüfe, dass das Mapping NICHT aufgerufen wurde, da KoSIT vorher fehlschlug
+        self.mock_mapper.assert_not_called()
+
+    def test_process_mapping_error(self, mock_db_session, mock_sync_storage_service, minimal_ubl_bytes):
+        """Testet den Workflow (INVALID), wenn das Mapping fehlschlägt."""
         
         transaction_id = str(uuid.uuid4())
         session, query = mock_db_session
@@ -62,19 +101,21 @@ class TestProcessorWorkflow:
         mock_sync_storage_service.download_blob_by_uri.return_value = minimal_ubl_bytes
 
         # Erzwinge einen Fehler im Mapper
-        mocker.patch('src.tasks.processor.map_xml_to_canonical', side_effect=MappingError("Pflichtfeld fehlt"))
+        # (XSD und KoSIT sind bereits durch das setup_mocks Fixture als erfolgreich gemockt)
+        self.mock_mapper.side_effect = MappingError("Pflichtfeld fehlt")
 
         # Führe den Task aus
         result = process_invoice_task(transaction_id)
 
         # Prüfe Ergebnisse
         assert result['status'] == TransactionStatus.INVALID.value
-        assert mock_transaction.status == TransactionStatus.INVALID
-        # Prüfe, ob der Fehler im Report enthalten ist (basierend auf dem Code in processor.py)
         assert "MAPPING_FAILED" in str(mock_transaction.validation_report)
+        
+        # Prüfe, dass Calculation NICHT aufgerufen wurde, da Mapping fehlschlug
+        self.mock_calc.assert_not_called()
 
     def test_process_unstructured_pdf(self, mock_db_session, mock_sync_storage_service, dummy_pdf_bytes):
-        """Testet den Workflow für ein PDF ohne strukturierte Daten."""
+        """Testet den Workflow (MANUAL_REVIEW) für ein PDF ohne strukturierte Daten."""
         
         transaction_id = str(uuid.uuid4())
         session, query = mock_db_session
@@ -88,6 +129,10 @@ class TestProcessorWorkflow:
         # Prüfe Ergebnisse
         assert result['status'] == TransactionStatus.MANUAL_REVIEW.value
         assert mock_transaction.format_detected == InvoiceFormat.OTHER_PDF
+        
+        # Prüfe, dass keine Validierung oder Mapping versucht wurde
+        self.mock_xsd.assert_not_called()
+        self.mock_mapper.assert_not_called()
 
     def test_process_idempotency(self, mock_db_session, mock_sync_storage_service):
         """Testet, ob der Task übersprungen wird, wenn er bereits läuft."""

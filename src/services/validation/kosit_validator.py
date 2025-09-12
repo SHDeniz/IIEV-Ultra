@@ -131,7 +131,7 @@ def _extract_svrl_item(item: etree._Element, severity: ValidationSeverity) -> Va
 
 def _create_system_error(code: str, message: str) -> ValidationError:
     return ValidationError(
-        category=ValidationCategory.SYSTEM,
+        category=ValidationCategory.TECHNICAL,
         severity=ValidationSeverity.FATAL,
         code=code,
         message=message

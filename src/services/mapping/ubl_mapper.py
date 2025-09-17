@@ -262,6 +262,30 @@ def _map_line_items(root: etree._Element, line_tag: str) -> List[InvoiceLine]:
         item = xp(line_el, './cac:Item', NSMAP_UBL)
         item_name = xp_text(item, './cbc:Name', NSMAP_UBL, mandatory=True)
         item_description = xp_text(item, './cbc:Description', NSMAP_UBL)
+        
+        # 3a. Artikel-Identifikation (EAN/GTIN/HAN für 3-Way-Match)
+        # Priorität: 1. StandardItemIdentification (GTIN/EAN), 2. SellersItemIdentification (HAN)
+        item_identifier = None
+        
+        # Versuche GTIN/EAN zu extrahieren
+        standard_id = xp_text(item, './cac:StandardItemIdentification/cbc:ID', NSMAP_UBL)
+        if standard_id:
+            item_identifier = standard_id
+            logger.debug(f"Position {line_id}: GTIN/EAN gefunden: {item_identifier}")
+        
+        # Fallback auf Verkäufer-Artikelnummer (HAN)
+        if not item_identifier:
+            sellers_id = xp_text(item, './cac:SellersItemIdentification/cbc:ID', NSMAP_UBL)
+            if sellers_id:
+                item_identifier = sellers_id
+                logger.debug(f"Position {line_id}: HAN gefunden: {item_identifier}")
+        
+        # Optional: BuyersItemIdentification als letzter Fallback
+        if not item_identifier:
+            buyers_id = xp_text(item, './cac:BuyersItemIdentification/cbc:ID', NSMAP_UBL)
+            if buyers_id:
+                item_identifier = buyers_id
+                logger.debug(f"Position {line_id}: Käufer-Artikelnummer gefunden: {item_identifier}")
 
         # 4. Steuern (Item/TaxCategory)
         tax_category_el = xp(item, './cac:ClassifiedTaxCategory', NSMAP_UBL)
@@ -292,6 +316,7 @@ def _map_line_items(root: etree._Element, line_tag: str) -> List[InvoiceLine]:
             line_id=line_id,
             item_name=item_name,
             item_description=item_description,
+            item_identifier=item_identifier,  # HAN/EAN/GTIN für ERP 3-Way-Match
             quantity=quantity,
             unit_code=unit_code,
             unit_price=unit_price,

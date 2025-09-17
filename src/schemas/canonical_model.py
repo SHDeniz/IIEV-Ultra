@@ -193,6 +193,7 @@ class InvoiceLine(BaseModel):
     item_name: str = Field(..., min_length=1, max_length=255)
     item_description: Optional[str] = None
     item_classification: Optional[str] = None  # z.B. UNSPSC Code
+    item_identifier: Optional[str] = None  # HAN/EAN/GTIN für 3-Way-Match mit ERP
     
     # Mengen und Einheiten
     quantity: Decimal

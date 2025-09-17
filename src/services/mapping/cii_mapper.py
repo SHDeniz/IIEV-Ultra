@@ -226,6 +226,31 @@ def _map_line_items(transaction: etree._Element) -> List[InvoiceLine]:
         product = xp(line_el, './ram:SpecifiedTradeProduct', NSMAP_CII)
         item_name = xp_text(product, './ram:Name', NSMAP_CII, mandatory=True)
         item_description = xp_text(product, './ram:Description', NSMAP_CII)
+        
+        # 2a. Artikel-Identifikation (EAN/GTIN/HAN für 3-Way-Match)
+        # Priorität: 1. GlobalID (GTIN/EAN), 2. SellerAssignedID (HAN), 3. BuyerAssignedID
+        item_identifier = None
+        
+        # Versuche GTIN/EAN zu extrahieren (GlobalID mit schemeID)
+        global_id_element = xp(product, './ram:GlobalID', NSMAP_CII)
+        if global_id_element is not None:
+            item_identifier = global_id_element.text
+            scheme_id = global_id_element.get('schemeID', '')
+            logger.debug(f"Position {line_id}: GlobalID gefunden ({scheme_id}): {item_identifier}")
+        
+        # Fallback auf Verkäufer-Artikelnummer (HAN)
+        if not item_identifier:
+            seller_id = xp_text(product, './ram:SellerAssignedID', NSMAP_CII)
+            if seller_id:
+                item_identifier = seller_id
+                logger.debug(f"Position {line_id}: SellerAssignedID (HAN) gefunden: {item_identifier}")
+        
+        # Optional: BuyerAssignedID als letzter Fallback
+        if not item_identifier:
+            buyer_id = xp_text(product, './ram:BuyerAssignedID', NSMAP_CII)
+            if buyer_id:
+                item_identifier = buyer_id
+                logger.debug(f"Position {line_id}: BuyerAssignedID gefunden: {item_identifier}")
 
         # 3. Transaktionsdetails (Agreement, Delivery, Settlement)
         line_agreement = xp(line_el, './ram:SpecifiedLineTradeAgreement', NSMAP_CII)
@@ -282,6 +307,7 @@ def _map_line_items(transaction: etree._Element) -> List[InvoiceLine]:
             line_id=line_id,
             item_name=item_name,
             item_description=item_description,
+            item_identifier=item_identifier,  # HAN/EAN/GTIN für ERP 3-Way-Match
             quantity=quantity,
             unit_code=unit_code,
             unit_price=unit_price,

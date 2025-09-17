@@ -1,4 +1,4 @@
-# src/tasks/processor.py (Aktualisiert und Kompatibel)
+# src/tasks/processor.py
 
 """
 Haupt-Verarbeitungs-Tasks
@@ -19,19 +19,15 @@ import hashlib
 from imap_tools import MailBox, AND, MailMessage
 
 from .worker import celery_app
-# Annahme: get_metadata_session existiert in db/session.py
 from ..db.session import get_metadata_session 
 from ..db.models import InvoiceTransaction, TransactionStatus, ProcessingLog, ValidationLevel, InvoiceFormat
 
-# WICHTIG: Importiere den neuen synchronen Storage Service
 from ..services.storage_service_sync import sync_storage_service
 
-# Importiere die User-Version von ValidationReport
 from ..schemas.validation_report import ValidationReport, ValidationStep, ValidationError, ValidationCategory, ValidationSeverity
 from ..schemas.canonical_model import CanonicalInvoice
 from ..core.config import settings
 
-# Importiere die neuen Services
 from ..services.extraction.extractor import extract_invoice_data
 from ..services.mapping.mapper import map_xml_to_canonical
 from ..services.mapping.xpath_util import MappingError
@@ -39,7 +35,10 @@ from ..services.mapping.xpath_util import MappingError
 from ..services.validation.xsd_validator import validate_xsd
 from ..services.validation.kosit_validator import validate_kosit_schematron
 from ..services.validation.calculation_validator import validate_calculations
-from ..db.models import ValidationLevel
+
+from ..services.validation.business_validator import validate_business_rules
+from ..services.erp.mssql_adapter import MSSQL_ERPAdapter
+from ..db.session import get_erp_session 
 
 
 logger = logging.getLogger(__name__)
@@ -105,9 +104,13 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
     canonical_invoice: Optional[CanonicalInvoice] = None
     
     try:
-        with get_metadata_session() as db:
+        # Wir benötigen ZWEI separate Sessions: Metadata DB und ERP DB.
+        with get_metadata_session() as db_meta, get_erp_session() as db_erp:
+            # Initialisiere den ERP Adapter mit der ERP Session
+            erp_adapter = MSSQL_ERPAdapter(db_session=db_erp)
+
             # Transaction laden
-            transaction = db.query(InvoiceTransaction).filter(
+            transaction = db_meta.query(InvoiceTransaction).filter(
                 InvoiceTransaction.id == transaction_id
             ).first()
             
@@ -122,9 +125,9 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             # Status auf PROCESSING setzen
             transaction.status = TransactionStatus.PROCESSING
             transaction.updated_at = datetime.now()
-            db.commit()
+            db_meta.commit()
             
-            _log_processing_step(db, transaction_id, "processing_started", "started", "Verarbeitung gestartet")
+            _log_processing_step(db_meta, transaction_id, "processing_started", "started", "Verarbeitung gestartet")
             
             # --------------------------------------------------------------------
             # SCHRITT 1: Laden, Format-Erkennung und Extraktion (Integration Sprint 1 & 2)
@@ -150,7 +153,7 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             
             transaction.format_detected = detected_format
             validation_report.detected_format = detected_format.value
-            db.commit()
+            db_meta.commit()
 
             # 1.3 Ergebnis prüfen und Workflow steuern
             format_step.duration_seconds = time.time() - step1_start
@@ -169,7 +172,7 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
                 validation_report.add_step(format_step)
                 
                 # Workflow hier beenden
-                return _finalize_processing(db, transaction, TransactionStatus.MANUAL_REVIEW, validation_report, start_time)
+                return _finalize_processing(db_meta, transaction, TransactionStatus.MANUAL_REVIEW, validation_report, start_time)
 
             # 1.4 XML Speichern (Synchron, falls extrahiert, z.B. bei ZUGFeRD)
             if detected_format in [InvoiceFormat.ZUGFERD_CII, InvoiceFormat.FACTURX_CII]:
@@ -180,16 +183,16 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
                     format_type=detected_format.value
                 )
                 transaction.storage_uri_xml = xml_uri
-                db.commit()
+                db_meta.commit()
             else:
                 # Bei XRechnung sind Raw Data = XML Data
                 transaction.storage_uri_xml = transaction.storage_uri_raw
-                db.commit()
+                db_meta.commit()
 
             format_step.status = "SUCCESS"
             format_step.metadata = {"format": detected_format.value, "xml_size_bytes": len(xml_bytes)}
             validation_report.add_step(format_step)
-            _log_processing_step(db, transaction_id, "format_detection", "completed", f"Format {detected_format.value} erkannt.", duration=format_step.duration_seconds)
+            _log_processing_step(db_meta, transaction_id, "format_detection", "completed", f"Format {detected_format.value} erkannt.", duration=format_step.duration_seconds)
 
             # --------------------------------------------------------------------
             # SCHRITT 2: Technische & Semantische Validierung (Sprint 3)
@@ -199,7 +202,7 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
 
             # 2.1 XSD Validierung
             xsd_failed = _execute_validation_step(
-                db, validation_report, "structure_validation_xsd", 
+                db_meta, validation_report, "structure_validation_xsd", 
                 "Validierung gegen EN 16931 XSD Schema",
                 lambda: validate_xsd(xml_bytes, detected_format)
             )
@@ -210,14 +213,14 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
                  # Setze Level nur, wenn es noch nicht gesetzt wurde
                  if transaction.validation_level_reached == ValidationLevel.NONE:
                      transaction.validation_level_reached = ValidationLevel.FORMAT
-                 return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
+                 return _finalize_processing(db_meta, transaction, TransactionStatus.INVALID, validation_report, start_time)
 
             transaction.validation_level_reached = ValidationLevel.STRUCTURE
-            db.commit()
+            db_meta.commit()
 
             # 2.2 KoSIT/Schematron Validierung
             kosit_failed = _execute_validation_step(
-                db, validation_report, "semantic_validation_kosit", 
+                db_meta, validation_report, "semantic_validation_kosit", 
                 "Prüfung der Geschäftsregeln (KoSIT/Schematron)",
                 # Wir übergeben transaction_id für das temporäre Dateihandling
                 lambda: validate_kosit_schematron(xml_bytes, str(transaction.id))
@@ -225,13 +228,13 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
 
             # Prüfe auf Fehler (Warnungen werden toleriert, Fehler führen zum Abbruch)
             if kosit_failed:
-                 logger.error(f"🛑 KoSIT Validierung fehlgeschlagen (Fehler gefunden). Breche Verarbeitung ab.")
-                 return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
+                logger.error(f"🛑 KoSIT Validierung fehlgeschlagen (Fehler gefunden). Breche Verarbeitung ab.")
+                return _finalize_processing(db_meta, transaction, TransactionStatus.INVALID, validation_report, start_time)
 
             transaction.validation_level_reached = ValidationLevel.SEMANTIC
             step2_duration = time.time() - step2_start
-            _log_processing_step(db, transaction_id, "validation_step2", "completed", f"Schritt 2 Validierung abgeschlossen", duration=step2_duration)
-            db.commit()
+            _log_processing_step(db_meta, transaction_id, "validation_step2", "completed", f"Schritt 2 Validierung abgeschlossen", duration=step2_duration)
+            db_meta.commit()
 
             # --------------------------------------------------------------------
             # SCHRITT 3: XML Mapping (Integration Sprint 2)
@@ -253,10 +256,10 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
                 mapping_step.metadata = {"invoice_number": canonical_invoice.invoice_number, "total_amount": str(canonical_invoice.payable_amount)}
                 validation_report.add_step(mapping_step)
                 
-                _log_processing_step(db, transaction_id, "xml_mapping", "completed", "Mapping zum Canonical Model erfolgreich.", duration=mapping_step.duration_seconds)
+                _log_processing_step(db_meta, transaction_id, "xml_mapping", "completed", "Mapping zum Canonical Model erfolgreich.", duration=mapping_step.duration_seconds)
                 
                 # Wichtige Daten in die Transaction Tabelle übertragen
-                _update_transaction_with_canonical_data(db, transaction, canonical_invoice)
+                _update_transaction_with_canonical_data(db_meta, transaction, canonical_invoice)
                 validation_report.invoice_number = canonical_invoice.invoice_number
 
             except MappingError as e:
@@ -273,10 +276,10 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
                     code="MAPPING_FAILED"
                 ))
                 validation_report.add_step(mapping_step)
-                _log_processing_step(db, transaction_id, "xml_mapping", "failed", str(e), duration=mapping_step.duration_seconds)
+                _log_processing_step(db_meta, transaction_id, "xml_mapping", "failed", str(e), duration=mapping_step.duration_seconds)
                 
                 # Workflow hier beenden und Status auf INVALID setzen
-                return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
+                return _finalize_processing(db_meta, transaction, TransactionStatus.INVALID, validation_report, start_time)
 
             # --------------------------------------------------------------------
             # SCHRITT 4: Mathematische Validierung (Sprint 3)
@@ -286,7 +289,7 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
 
             # canonical_invoice muss hier existieren.
             calc_failed = _execute_validation_step(
-                db, validation_report, "calculation_validation", 
+                db_meta, validation_report, "calculation_validation", 
                 "Mathematische Prüfung der Summen und Steuern",
                 lambda: validate_calculations(canonical_invoice)
             )
@@ -294,24 +297,40 @@ def process_invoice_task(self, transaction_id: str) -> Dict[str, Any]:
             # Prüfe auf Fehler
             if calc_failed:
                  logger.error(f"🛑 Mathematische Validierung fehlgeschlagen. Breche Verarbeitung ab.")
-                 return _finalize_processing(db, transaction, TransactionStatus.INVALID, validation_report, start_time)
+                 return _finalize_processing(db_meta, transaction, TransactionStatus.INVALID, validation_report, start_time)
 
             step4_duration = time.time() - step4_start
-            _log_processing_step(db, transaction_id, "calculation_validation", "completed", "Mathematische Validierung abgeschlossen", duration=step4_duration)
+            _log_processing_step(db_meta, transaction_id, "calculation_validation", "completed", "Mathematische Validierung abgeschlossen", duration=step4_duration)
             transaction.validation_level_reached = ValidationLevel.COMPLIANCE
-            db.commit()
+            db_meta.commit()
 
 
             # --------------------------------------------------------------------
-            # SCHRITT 5: Business Validierung (Placeholder für Sprint 4/5)
+            # SCHRITT 5: Business Validierung (ERP Integration) (Sprint 4/5)
             # --------------------------------------------------------------------
-            logger.info(f"🏢 Schritt 5: Business Validierung (ERP) - Platzhalter")
-            validation_report.add_step(ValidationStep(step_name="business_validation_erp", status="SKIPPED"))
+            logger.info(f"🏢 Schritt 5: Business Validierung (ERP) für {transaction_id}")
 
+            # Führe die Business Validierung aus
+            business_failed = _execute_validation_step(
+                db_meta, validation_report, "business_validation_erp", 
+                "Abgleich mit ERP-Stammdaten und Bewegungsdaten",
+                # Übergebe das Invoice Objekt und den initialisierten Adapter
+                lambda: validate_business_rules(canonical_invoice, erp_adapter)
+            )
+
+            # Prüfe auf Fehler oder fatale Fehler (z.B. Dubletten)
+            # report._update_summary() wird in _execute_validation_step aufgerufen.
+            if validation_report.summary.fatal_errors > 0 or business_failed:
+                 logger.error(f"🛑 Business Validierung fehlgeschlagen. Breche Verarbeitung ab.")
+                 # Status wird automatisch in _finalize_processing basierend auf dem Report gesetzt (INVALID oder MANUAL_REVIEW).
+                 return _finalize_processing(db_meta, transaction, None, validation_report, start_time)
+
+            transaction.validation_level_reached = ValidationLevel.BUSINESS
+            db_meta.commit()
 
             # FINALER STATUS
-            # Wir übergeben None, damit _finalize_processing den Status automatisch bestimmt.
-            return _finalize_processing(db, transaction, None, validation_report, start_time)
+            # Status wird automatisch bestimmt (VALID oder MANUAL_REVIEW bei Warnungen).
+            return _finalize_processing(db_meta, transaction, None, validation_report, start_time)
             
     except Exception as e:
         # Generelle Fehlerbehandlung für Systemfehler (Retry durch Celery)
